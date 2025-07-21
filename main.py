@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Enhanced Music Organizer & Tag Fixer
+Improved Music Organizer & Tag Fixer
 
 Features:
 1. Interactive prompts for root & output folders, copy/move mode.
 2. Network check up‐front (skips online lookups if offline).
-3. Counts files, then shows Rich progress bar with ETA.
+3. Uses Rich transient progress bars for dependency installation and file processing.
 4. Duplicate detection (SHA-1) with prompt to delete.
 5. Full metadata support for .mp3, .flac, .m4a/.mp4, .ogg, .wav.
 6. Fetch lyrics from Genius (requires GENIUS_TOKEN).
@@ -15,22 +14,36 @@ Features:
 8. Copies or moves processed files to an `output` folder, structured by Artist/Title–Album.
 9. Logs to console (Rich), to ~/.music_organizer/organizer.log, and to ~/.music_organizer/report.csv.
 """
-
 import os
 import sys
 import subprocess
 import sqlite3
-import logging
 import hashlib
 import argparse
 import configparser
 import csv
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, List
+import logging 
 
 # -----------------------------------------------------------------------------
-# SECTION 0: Auto‐install missing dependencies
+# SECTION 0: Preliminary Setup
+# -----------------------------------------------------------------------------
+APP_DIR    = Path.home() / ".music_organizer"
+DB_PATH    = APP_DIR / "processed_songs.db"
+LOG_FILE   = APP_DIR / "organizer.log"
+REPORT_CSV = APP_DIR / "report.csv"
+CONFIG_INI = APP_DIR / "config.ini"
+APP_DIR.mkdir(exist_ok=True)
+
+# Read config if present
+config = configparser.ConfigParser()
+if CONFIG_INI.exists():
+    config.read(CONFIG_INI)
+
+# -----------------------------------------------------------------------------
+# SECTION 1: Install Missing Packages (with Rich Progress)
 # -----------------------------------------------------------------------------
 REQUIRED_PACKAGES = [
     "mutagen", "requests", "lyricsgenius", "rich",
@@ -38,17 +51,41 @@ REQUIRED_PACKAGES = [
 ]
 
 def install_missing_packages():
+    """
+    Attempt to import each package in REQUIRED_PACKAGES.
+    If ImportError is raised, pip-install it while displaying
+    a transient Rich progress bar.
+    """
+    from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, SpinnerColumn
+    missing: List[str] = []
     for pkg in REQUIRED_PACKAGES:
         try:
             __import__(pkg)
         except ImportError:
-            print(f"[INSTALLING] {pkg} ...")
+            missing.append(pkg)
+
+    if not missing:
+        return
+
+    console = __import__("rich").console.Console()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[blue]Installing[/blue] {task.description}"),
+        BarColumn(),
+        TimeElapsedColumn(),
+        transient=True,
+        console=console
+    ) as progress:
+        task = progress.add_task("packages", total=len(missing))
+        for pkg in missing:
+            progress.update(task, description=pkg)
             subprocess.run([sys.executable, "-m", "pip", "install", pkg], check=True)
+            progress.advance(task)
 
 install_missing_packages()
 
 # -----------------------------------------------------------------------------
-# SECTION 1: Imports (safe after installing deps)
+# SECTION 2: Imports (safe after pip installs)
 # -----------------------------------------------------------------------------
 import mutagen
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, USLT, APIC
@@ -65,29 +102,15 @@ from send2trash import send2trash
 from rich.console import Console
 from rich.panel import Panel
 from rich.logging import RichHandler
-from rich.progress import (
-    Progress, SpinnerColumn, TextColumn,
-    BarColumn, TimeElapsedColumn, TimeRemainingColumn
-)
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.prompt import Prompt
 
 from PIL import Image
 from io import BytesIO
 
 # -----------------------------------------------------------------------------
-# SECTION 2: Configuration & Logger Setup
+# SECTION 3: Logging & Genius Client
 # -----------------------------------------------------------------------------
-APP_DIR    = Path.home() / ".music_organizer"
-DB_PATH    = APP_DIR / "processed_songs.db"
-LOG_FILE   = APP_DIR / "organizer.log"
-REPORT_CSV = APP_DIR / "report.csv"
-CONFIG_INI = APP_DIR / "config.ini"
-APP_DIR.mkdir(exist_ok=True)
-
-config = configparser.ConfigParser()
-if CONFIG_INI.exists():
-    config.read(CONFIG_INI)
-
 logging.basicConfig(
     level="INFO",
     format="%(message)s",
@@ -102,13 +125,10 @@ GENIUS_TOKEN = (
     os.getenv("GENIUS_TOKEN") or
     config.get("lyrics", "genius_token", fallback=None)
 )
-if GENIUS_TOKEN:
-    genius_client = lyricsgenius.Genius(GENIUS_TOKEN, timeout=15, retries=3)
-else:
-    genius_client = None
+genius_client = lyricsgenius.Genius(GENIUS_TOKEN, timeout=15, retries=3) if GENIUS_TOKEN else None
 
 # -----------------------------------------------------------------------------
-# SECTION 3: Database Helpers
+# SECTION 4: Database Helpers
 # -----------------------------------------------------------------------------
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS processed (
@@ -119,19 +139,26 @@ CREATE TABLE IF NOT EXISTS processed (
     title TEXT,
     album TEXT,
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"""
+)"""
 
-def get_db_connection():
+def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(CREATE_TABLE_SQL)
+    conn.commit()
     return conn
 
-def is_already_processed(conn, file_hash: str) -> bool:
+def is_already_processed(conn: sqlite3.Connection, file_hash: str) -> bool:
     cur = conn.execute("SELECT 1 FROM processed WHERE file_hash = ?", (file_hash,))
     return cur.fetchone() is not None
 
-def mark_as_processed(conn, file_hash, original_path, artist, title, album):
+def mark_as_processed(
+    conn: sqlite3.Connection,
+    file_hash: str,
+    original_path: str,
+    artist: str,
+    title: str,
+    album: str
+) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO processed (file_hash, original_path, artist, title, album) VALUES (?,?,?,?,?)",
         (file_hash, original_path, artist, title, album)
@@ -139,7 +166,7 @@ def mark_as_processed(conn, file_hash, original_path, artist, title, album):
     conn.commit()
 
 # -----------------------------------------------------------------------------
-# SECTION 4: Utility Functions
+# SECTION 5: Utility Functions
 # -----------------------------------------------------------------------------
 def file_sha1(path: Path, chunk_size: int = 8192) -> str:
     h = hashlib.sha1()
@@ -152,8 +179,10 @@ def sanitize_filename(s: str) -> str:
     keep = "-_.() abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     return "".join(ch if ch in keep else "_" for ch in s).strip()
 
-def infer_tags_from_filename(path: Path):
-    """Try 'Artist - Title [Album]'."""
+def infer_tags_from_filename(path: Path) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Attempt to parse 'Artist - Title [Album]' from the filename.
+    """
     name = path.stem
     artist = title = album = None
     if " - " in name:
@@ -175,18 +204,18 @@ def fetch_lyrics(artist: str, title: str) -> Optional[str]:
         return song.lyrics if song else None
     except Exception as e:
         logger.debug(f"Lyric fetch error: {e}")
-    return None
+        return None
 
 def fetch_itunes_cover(artist: str, title: str) -> Optional[bytes]:
     try:
         q = requests.utils.requote_uri(f"{artist} {title}")
         url = f"https://itunes.apple.com/search?term={q}&entity=song&limit=1"
-        r = requests.get(url, timeout=10); r.raise_for_status()
-        items = r.json().get("results", [])
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        items = resp.json().get("results", [])
         if items:
-            art = items[0].get("artworkUrl100", "")
-            hi = art.replace("100x100", "600x600")
-            return requests.get(hi, timeout=10).content
+            art_url = items[0].get("artworkUrl100", "").replace("100x100", "600x600")
+            return requests.get(art_url, timeout=10).content
     except Exception:
         return None
     return None
@@ -219,11 +248,14 @@ def embed_tags_and_cover(
     album: Optional[str],
     lyrics: Optional[str],
     cover_data: Optional[bytes]
-):
-    suf = path.suffix.lower()
+) -> None:
+    """
+    Write metadata (artist, title, album, lyrics, cover image) into the file at `path`.
+    """
     if cover_data is None:
         cover_data = fetch_itunes_cover(artist, title)
 
+    suf = path.suffix.lower()
     if suf == ".mp3":
         audio = ID3(str(path))
         audio.delall("TPE1"); audio.add(TPE1(encoding=3, text=artist))
@@ -239,20 +271,19 @@ def embed_tags_and_cover(
 
     elif suf == ".flac":
         audio = FLAC(str(path))
-        audio["artist"] = artist; audio["title"] = title
+        audio["artist"], audio["title"] = artist, title
         if album: audio["album"] = album
         if lyrics: audio["lyrics"] = lyrics
         if cover_data:
             audio.clear_pictures()
             pic = Picture()
-            pic.type = 3; pic.mime = "image/jpeg"; pic.desc = "Cover"; pic.data = cover_data
+            pic.type, pic.mime, pic.desc, pic.data = 3, "image/jpeg", "Cover", cover_data
             audio.add_picture(pic)
         audio.save()
 
     elif suf in (".m4a", ".mp4"):
         audio = MP4(str(path))
-        audio.tags["\xa9ART"] = [artist]
-        audio.tags["\xa9nam"] = [title]
+        audio.tags["\xa9ART"], audio.tags["\xa9nam"] = [artist], [title]
         if album: audio.tags["\xa9alb"] = [album]
         if lyrics: audio.tags["\xa9lyr"] = [lyrics]
         if cover_data:
@@ -261,36 +292,34 @@ def embed_tags_and_cover(
 
     elif suf == ".ogg":
         audio = OggVorbis(str(path))
-        audio["artist"] = artist; audio["title"] = title
+        audio["artist"], audio["title"] = artist, title
         if album: audio["album"] = album
         if lyrics: audio["lyrics"] = lyrics
         audio.save()
 
-    elif suf == ".wav":
-        # WAV tagging is limited; skip
-        pass
+    # WAV tagging is very limited—skipped.
 
 # -----------------------------------------------------------------------------
-# SECTION 5: Process One File
+# SECTION 6: Process a Single File
 # -----------------------------------------------------------------------------
 def process_file(
     src: Path,
-    conn,
+    conn: sqlite3.Connection,
     console: Console,
     writer: csv.writer,
     output_root: Path,
     copy_mode: bool,
     network_ok: bool
-):
-    file_hash = file_sha1(src)
-    if is_already_processed(conn, file_hash):
-        console.print(f"[yellow]Duplicate found:[/yellow] {src}")
+) -> None:
+    fhash = file_sha1(src)
+    if is_already_processed(conn, fhash):
+        console.print(f"[yellow]Duplicate found:[/yellow] {src.name}")
         if Prompt.ask("Delete original?", choices=["y", "n"], default="n") == "y":
             src.unlink(missing_ok=True)
             console.log(f"[red]Deleted[/red] {src}")
         return
 
-    # Read existing tags
+    # Read existing metadata
     artist = title = album = None
     try:
         easy = EasyID3(str(src))
@@ -300,11 +329,11 @@ def process_file(
     except Exception:
         pass
 
-    # Fallback filename inference
+    # Fallback: infer from filename
     ia, it, ialb = infer_tags_from_filename(src)
     artist = artist or ia
-    title  = title or it
-    album  = album or ialb
+    title  = title  or it
+    album  = album  or ialb
 
     if not artist or not title:
         logger.warning(f"Skipping (no artist/title): {src}")
@@ -313,18 +342,18 @@ def process_file(
     cover  = extract_existing_cover(src)
     lyrics = fetch_lyrics(artist, title) if (network_ok and genius_client) else None
 
-    # Build target folder & filename
-    art_dir = sanitize_filename(artist)
-    tit_fn  = sanitize_filename(title)
-    alb_fn  = sanitize_filename(album) if album else ""
-    ext     = src.suffix.lower()
-    new_name = f"{tit_fn} – {alb_fn}{ext}" if alb_fn else f"{tit_fn}{ext}"
+    # Prepare destination
+    artist_dir = sanitize_filename(artist)
+    title_fn   = sanitize_filename(title)
+    album_fn   = sanitize_filename(album) if album else ""
+    ext        = src.suffix.lower()
+    new_name   = f"{title_fn} – {album_fn}{ext}" if album_fn else f"{title_fn}{ext}"
 
-    dest_dir  = output_root / art_dir
+    dest_dir  = output_root / artist_dir
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / new_name
 
-    # Copy or Move
+    # Copy or move
     if copy_mode:
         console.log(f"[cyan]Copying[/cyan] {src.name} → {new_name}")
         shutil.copy2(str(src), str(dest_path))
@@ -334,48 +363,44 @@ def process_file(
         src.rename(dest_path)
         action = "MOVED"
 
-    # Embed tags+cover+lyrics on dest_path
+    # Embed metadata
     embed_tags_and_cover(dest_path, artist, title, album, lyrics, cover)
 
-    # Mark & log
-    mark_as_processed(conn, file_hash, str(src), artist, title, album or "")
+    # Record in DB + CSV
+    mark_as_processed(conn, fhash, str(src), artist, title, album or "")
     writer.writerow([str(src), str(dest_path), artist, title, album or "", action])
 
 # -----------------------------------------------------------------------------
-# SECTION 6: Main
+# SECTION 7: Main Routine
 # -----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Organize & tag your music collection")
-    parser.add_argument("--root", "-r",
-        default=config.get("general", "root", fallback=None),
-        help="Path to unsorted music folder"
-    )
-    args = parser.parse_args()
-
     console = Console()
 
-    # 1) Determine root folder
-    if args.root:
-        root = Path(args.root).expanduser()
-    else:
-        root = None
+    # 1) CLI args
+    parser = argparse.ArgumentParser(description="Organize & tag your music collection")
+    parser.add_argument("--root", "-r",
+                        default=config.get("general", "root", fallback=None),
+                        help="Path to unsorted music folder")
+    args = parser.parse_args()
 
+    # 2) Determine root folder
+    root = Path(args.root).expanduser() if args.root else None
     while not root or not root.is_dir():
-        console.print(f"[yellow]Invalid root folder:[/yellow] {root}")
+        console.print(f"[red]Invalid root folder:[/red] {root}")
         inp = Prompt.ask("Enter full path to your music folder")
         root = Path(inp).expanduser()
 
-    # 2) Output folder
+    # 3) Output folder & mode
     default_out = root / "output"
-    out = Prompt.ask("Output folder?", default=str(default_out))
+    out        = Prompt.ask("Output folder?", default=str(default_out))
     output_root = Path(out).expanduser()
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # 3) Copy vs Move
-    mode = Prompt.ask("Keep originals (copy) or cut (move)?", choices=["copy","move"], default="copy")
+    mode      = Prompt.ask("Keep originals (copy) or cut (move)?",
+                           choices=["copy", "move"], default="copy")
     copy_mode = (mode == "copy")
 
-    # 4) Network check
+    # 4) Network check (spinner)
     with console.status("[bold cyan]Checking network...[/bold cyan]", spinner="dots"):
         try:
             requests.get("https://www.google.com", timeout=5).raise_for_status()
@@ -386,7 +411,7 @@ def main():
     if not network_ok:
         logger.warning("Offline: skipping Genius lyrics & iTunes cover fetch.")
 
-    # 5) Gather all files first
+    # 5) Collect all audio files
     exts = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".wav", ".aac"}
     all_files = [p for p in root.rglob("*") if p.suffix.lower() in exts]
     total = len(all_files)
@@ -394,36 +419,36 @@ def main():
         console.print("[red]No audio files found![/red]")
         sys.exit(1)
 
-    # 6) Prepare DB & CSV report
+    # 6) Prepare DB & CSV
     conn = get_db_connection()
-    new_report = not REPORT_CSV.exists()
+    is_new = not REPORT_CSV.exists()
     rpt = open(REPORT_CSV, "a", newline="", encoding="utf-8")
     writer = csv.writer(rpt)
-    if new_report:
+    if is_new:
         writer.writerow(["Old Path","New Path","Artist","Title","Album","Action"])
 
-    # 7) Process with Rich Progress
+    # 7) Show summary panel
     console.print(Panel.fit(
-        f"🎵 Organizer\nRoot: [bold]{root}[/bold]\nOutput: [bold]{output_root}[/bold]\n"
-        f"Mode: [bold]{mode}[/bold]\nFiles: [bold]{total}[/bold]\n",
+        f"🎵 Organizer\nRoot: [bold]{root}[/bold]\n"
+        f"Output: [bold]{output_root}[/bold]\n"
+        f"Mode: [bold]{mode}[/bold]\nFiles: [bold]{total}[/bold]",
         title="Music Organizer", style="magenta"
     ))
 
+    # 8) Process with a single transient Rich progress bar
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
+        transient=True,
         console=console
     ) as progress:
         task = progress.add_task("Processing files...", total=total)
         for src in all_files:
             progress.update(task, description=f"▶️ {src.name}")
-            process_file(
-                src, conn, console, writer,
-                output_root, copy_mode, network_ok
-            )
+            process_file(src, conn, console, writer, output_root, copy_mode, network_ok)
             progress.advance(task)
 
     rpt.close()
@@ -431,6 +456,7 @@ def main():
         f"[green]All done![/green]\n• Log: {LOG_FILE}\n• Report: {REPORT_CSV}",
         title="🎉 Finished"
     ))
+
 
 if __name__ == "__main__":
     main()
