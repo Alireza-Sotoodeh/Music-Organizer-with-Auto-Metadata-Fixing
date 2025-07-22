@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Enhanced Music File Organizer v2.3
+Enhanced Music File Organizer v2.4
 -----------------------------------
 
 Features:
-1. Interactive prompts for root & output folders, copy/move mode, organization type.
-2. Flexible file naming: "Artist - Title [Album]" or "Artist - Title" if no album.
-3. Optional folder organization by artist (default: flat in output folder).
-4. Interactive lyrics/cover fetching options (default: yes for both).
-5. Automatic dependency installation with minimal terminal output.
-6. Network connectivity monitoring with real-time ping display.
-7. Advanced duplicate detection using SHA-1 hashing with caching.
-8. Full metadata support for .mp3, .flac, .m4a/.mp4, .ogg, .wav, .wma.
-9. Multiple online metadata sources (Genius, AZLyrics, iTunes, Last.fm, Spotify).
-10. Single clean progress display that replaces itself for each file.
-11. Comprehensive Windows-compatible metadata including subtitle (lyrics) and tags.
-12. Proper cover art and lyrics embedding with verification.
+1. Always asks for root & output folders with smart defaults.
+2. Interactive prompts for artist folders and language-based organization.
+3. Post-processing retry for missing covers and lyrics.
+4. Flexible file naming: "Artist - Title [Album]" or "Artist - Title" if no album.
+5. Language-based folder organization (Persian, English, Arabic, etc.).
+6. Interactive lyrics/cover fetching options with retry mechanism.
+7. Automatic dependency installation with minimal terminal output.
+8. Network connectivity monitoring with real-time ping display.
+9. Advanced duplicate detection using SHA-1 hashing with caching.
+10. Full metadata support for .mp3, .flac, .m4a/.mp4, .ogg, .wav, .wma.
+11. Multiple online metadata sources (Genius, AZLyrics, iTunes, Last.fm, Spotify).
+12. Single clean progress display that replaces itself for each file.
+13. Comprehensive Windows-compatible metadata including subtitle (lyrics) and tags.
+14. Proper cover art and lyrics embedding with verification.
 """
 
 # -----------------------------------------------------------------------------
@@ -131,6 +133,7 @@ class Config:
     output_folder: str = ""
     mode: str = "copy"  # copy or move
     organize_by_artist: bool = False
+    organize_by_language: bool = False
     fetch_lyrics: bool = True
     fetch_covers: bool = True
     max_workers: int = 4
@@ -165,12 +168,21 @@ class FileStats:
     lyrics_found: int = 0
     covers_found: int = 0
     total_size: int = 0
+    missing_lyrics: List[str] = None
+    missing_covers: List[str] = None
+    
+    def __post_init__(self):
+        if self.missing_lyrics is None:
+            self.missing_lyrics = []
+        if self.missing_covers is None:
+            self.missing_covers = []
     
     def save(self, reports_folder: Path):
         """Save stats to file in reports folder"""
         stats_file = reports_folder / 'stats.json'
+        stats_dict = asdict(self)
         with open(stats_file, 'w') as f:
-            json.dump(asdict(self), f, indent=2)
+            json.dump(stats_dict, f, indent=2)
 
 # -----------------------------------------------------------------------------
 # SECTION 3: Network Monitoring & Connectivity
@@ -503,6 +515,8 @@ class MetadataEnhancer:
         sources = [
             self._fetch_cover_itunes,
             self._fetch_cover_lastfm,
+            self._fetch_cover_coverartarchive,
+            self._fetch_cover_deezer
         ]
         
         for source_func in sources:
@@ -566,6 +580,64 @@ class MetadataEnhancer:
                 img_url = img.get("#text")
                 if img_url:
                     img_response = self.session.get(img_url, timeout=self.timeout)
+                    if img_response.status_code == 200 and len(img_response.content) > 1000:
+                        return img_response.content
+            
+        except Exception:
+            pass
+        
+        return None
+    
+    def _fetch_cover_coverartarchive(self, artist: str, album: str) -> Optional[bytes]:
+        """Fetch cover art from Cover Art Archive via MusicBrainz"""
+        try:
+            # Search MusicBrainz for album
+            search_url = "https://musicbrainz.org/ws/2/release"
+            params = {
+                "query": f'artist:"{artist}" AND release:"{album}"',
+                "fmt": "json",
+                "limit": 5
+            }
+            
+            response = self.session.get(search_url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            releases = data.get("releases", [])
+            
+            for release in releases:
+                release_id = release.get("id")
+                if release_id:
+                    # Try to get cover art
+                    cover_url = f"https://coverartarchive.org/release/{release_id}/front"
+                    img_response = self.session.get(cover_url, timeout=self.timeout)
+                    if img_response.status_code == 200 and len(img_response.content) > 1000:
+                        return img_response.content
+            
+        except Exception:
+            pass
+        
+        return None
+    
+    def _fetch_cover_deezer(self, artist: str, album: str) -> Optional[bytes]:
+        """Fetch cover art from Deezer API"""
+        try:
+            # Search Deezer for album
+            search_url = "https://api.deezer.com/search/album"
+            params = {"q": f"{artist} {album}"}
+            
+            response = self.session.get(search_url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            albums = data.get("data", [])
+            
+            for album_data in albums:
+                cover_url = album_data.get("cover_xl")  # Highest resolution
+                if cover_url:
+                    img_response = self.session.get(cover_url, timeout=self.timeout)
                     if img_response.status_code == 200 and len(img_response.content) > 1000:
                         return img_response.content
             
@@ -865,6 +937,7 @@ class MusicOrganizer:
         try:
             self.network_monitor.start_monitoring()
             self._run_organization()
+            self._post_processing()
         finally:
             self.network_monitor.stop_monitoring()
             self.stats.save(self.reports_dir)
@@ -878,14 +951,16 @@ class MusicOrganizer:
         
         # Display configuration panel
         organization_mode = "Artist folders" if self.config.organize_by_artist else "Flat (all in output folder)"
+        language_mode = "Language-based folders" if self.config.organize_by_language else "Mixed languages"
         
         console.print(Panel.fit(
-            "[bold green]🎵 Enhanced Music Organizer v2.3[/bold green]\n"
+            "[bold green]🎵 Enhanced Music Organizer v2.4[/bold green]\n"
             f"[cyan]Root:[/cyan] {self.config.root_folder}\n"
             f"[cyan]Output:[/cyan] {self.config.output_folder}\n"
             f"[cyan]Reports:[/cyan] {self.reports_dir}\n"
             f"[cyan]Mode:[/cyan] {self.config.mode.upper()}\n"
             f"[cyan]Organization:[/cyan] {organization_mode}\n"
+            f"[cyan]Language Sort:[/cyan] {language_mode}\n"
             f"[cyan]Fetch Lyrics:[/cyan] {'Yes' if self.config.fetch_lyrics else 'No'}\n"
             f"[cyan]Fetch Covers:[/cyan] {'Yes' if self.config.fetch_covers else 'No'}",
             title="Configuration"
@@ -912,8 +987,142 @@ class MusicOrganizer:
         # Step 3: Process all files
         self._process_files(music_files)
         
-        # Step 4: Show final statistics
+        # Step 4: Show initial statistics
+        self._show_initial_stats()
+    
+    def _post_processing(self):
+        """Post-processing for missing covers and lyrics"""
+        logger = logging.getLogger("music_organizer")
+        
+        # Check for songs without covers
+        if self.stats.missing_covers and self.network_monitor.is_connected:
+            retry_covers = Confirm.ask(
+                f"\n🖼️  {len(self.stats.missing_covers)} songs are missing covers. Search again for covers?",
+                default=False
+            )
+            
+            if retry_covers:
+                console.print("\n[yellow]🖼️  Searching for missing covers...[/yellow]")
+                self._retry_missing_covers()
+        
+        # Check for songs without lyrics
+        if self.stats.missing_lyrics and self.network_monitor.is_connected:
+            retry_lyrics = Confirm.ask(
+                f"\n📝 {len(self.stats.missing_lyrics)} songs are missing lyrics. Search again for lyrics?",
+                default=False
+            )
+            
+            if retry_lyrics:
+                console.print("\n[yellow]📝 Searching for missing lyrics...[/yellow]")
+                self._retry_missing_lyrics()
+        
+        # Show final statistics
         self._show_final_stats()
+    
+    def _retry_missing_covers(self):
+        """Retry fetching covers for songs that didn't have them"""
+        found_covers = 0
+        
+        with self.progress_manager.create_progress_display(len(self.stats.missing_covers)) as progress:
+            task = progress.add_task(
+                "Searching covers...",
+                total=len(self.stats.missing_covers),
+                network_status=self.network_monitor.get_status(),
+                errors=0,
+                duplicates=0
+            )
+            
+            for file_path_str in self.stats.missing_covers:
+                file_path = Path(file_path_str)
+                if not file_path.exists():
+                    progress.advance(task)
+                    continue
+                
+                progress.update(task, description=file_path.name)
+                
+                try:
+                    # Re-extract metadata
+                    audio_file = mutagen.File(file_path)
+                    if audio_file:
+                        metadata = self._extract_comprehensive_metadata(audio_file, file_path)
+                        
+                        # Try to fetch cover art
+                        if metadata['album'] != 'Unknown Album':
+                            cover_art = self.metadata_enhancer.fetch_cover_art(
+                                metadata['artist'], metadata['album']
+                            )
+                            
+                            if cover_art:
+                                # Embed the cover art
+                                self.metadata_enhancer.embed_comprehensive_metadata(
+                                    file_path, metadata, None, cover_art
+                                )
+                                found_covers += 1
+                                console.print(f"\n🖼️  Found cover for: {metadata['artist']} - {metadata['album']}")
+                
+                except Exception as e:
+                    logger = logging.getLogger("music_organizer")
+                    logger.error(f"Error retrying cover for {file_path}: {e}")
+                
+                progress.advance(task)
+        
+        if found_covers > 0:
+            console.print(f"\n[green]✅ Found {found_covers} additional covers![/green]")
+            self.stats.covers_found += found_covers
+        else:
+            console.print("\n[yellow]⚠️  No additional covers found[/yellow]")
+    
+    def _retry_missing_lyrics(self):
+        """Retry fetching lyrics for songs that didn't have them"""
+        found_lyrics = 0
+        
+        with self.progress_manager.create_progress_display(len(self.stats.missing_lyrics)) as progress:
+            task = progress.add_task(
+                "Searching lyrics...",
+                total=len(self.stats.missing_lyrics),
+                network_status=self.network_monitor.get_status(),
+                errors=0,
+                duplicates=0
+            )
+            
+            for file_path_str in self.stats.missing_lyrics:
+                file_path = Path(file_path_str)
+                if not file_path.exists():
+                    progress.advance(task)
+                    continue
+                
+                progress.update(task, description=file_path.name)
+                
+                try:
+                    # Re-extract metadata
+                    audio_file = mutagen.File(file_path)
+                    if audio_file:
+                        metadata = self._extract_comprehensive_metadata(audio_file, file_path)
+                        
+                        # Try to fetch lyrics
+                        lyrics = self.metadata_enhancer.fetch_lyrics(
+                            metadata['artist'], metadata['title']
+                        )
+                        
+                        if lyrics:
+                            # Embed the lyrics
+                            self.metadata_enhancer.embed_comprehensive_metadata(
+                                file_path, metadata, lyrics, None
+                            )
+                            found_lyrics += 1
+                            console.print(f"\n📝 Found lyrics for: {metadata['artist']} - {metadata['title']}")
+                
+                except Exception as e:
+                    logger = logging.getLogger("music_organizer")
+                    logger.error(f"Error retrying lyrics for {file_path}: {e}")
+                
+                progress.advance(task)
+        
+        if found_lyrics > 0:
+            console.print(f"\n[green]✅ Found {found_lyrics} additional lyrics![/green]")
+            self.stats.lyrics_found += found_lyrics
+        else:
+            console.print("\n[yellow]⚠️  No additional lyrics found[/yellow]")
     
     def _get_music_files(self, root_path: Path) -> List[Path]:
         """Recursively find all supported music files"""
@@ -1012,8 +1221,14 @@ class MusicOrganizer:
                     if result:
                         if result.get('lyrics_found'):
                             console.print(f"📝 Found lyrics for: {result['artist']} - {result['title']}")
+                        else:
+                            self.stats.missing_lyrics.append(str(result['output_path']))
+                            
                         if result.get('cover_found'):
                             console.print(f"🖼️  Found cover for: {result['artist']} - {result['album']}")
+                        else:
+                            self.stats.missing_covers.append(str(result['output_path']))
+                            
                         console.print(f"INFO     Processed: {file_path.name} -> {result['output_filename']}")
                     
                 except Exception as e:
@@ -1105,6 +1320,7 @@ class MusicOrganizer:
                 'title': metadata['title'],
                 'album': metadata['album'],
                 'output_filename': output_path.name,
+                'output_path': output_path,
                 'lyrics_found': lyrics_found,
                 'cover_found': cover_found
             }
@@ -1199,11 +1415,12 @@ class MusicOrganizer:
         return None
     
     def _generate_output_path(self, metadata: Dict[str, Any], extension: str) -> Path:
-        """Generate organized output path with new naming convention"""
+        """Generate organized output path with language and artist organization"""
         # Clean filename components
         artist = metadata['artist']
         title = metadata['title'] 
         album = metadata['album']
+        language = metadata['language']
         
         # Create filename: "Artist - Title [Album]" or "Artist - Title"
         if album and album != 'Unknown Album':
@@ -1211,13 +1428,18 @@ class MusicOrganizer:
         else:
             filename = f"{artist} - {title}{extension}"
         
-        # Determine output path based on organization setting
+        # Determine output path based on organization settings
+        base_path = self.output_dir
+        
+        # Language-based organization (highest priority)
+        if self.config.organize_by_language:
+            base_path = base_path / language
+        
+        # Artist-based organization
         if self.config.organize_by_artist:
-            # Organize into artist folders
-            return self.output_dir / artist / filename
-        else:
-            # Flat organization (all files in output folder)
-            return self.output_dir / filename
+            base_path = base_path / artist
+        
+        return base_path / filename
     
     def _resolve_file_conflict(self, path: Path) -> Path:
         """Resolve naming conflicts by adding numbers or timestamps"""
@@ -1253,8 +1475,8 @@ class MusicOrganizer:
         filename = filename.strip(' .')
         return filename[:100] if filename else "Unknown"
     
-    def _show_final_stats(self):
-        """Display comprehensive processing statistics"""
+    def _show_initial_stats(self):
+        """Display initial processing statistics"""
         logger = logging.getLogger("music_organizer")
         
         # Create detailed statistics table
@@ -1268,6 +1490,30 @@ class MusicOrganizer:
         table.add_row("Duplicates Removed", str(self.stats.duplicates))
         table.add_row("Lyrics Found & Embedded", str(self.stats.lyrics_found))
         table.add_row("Covers Downloaded & Embedded", str(self.stats.covers_found))
+        table.add_row("Songs Missing Lyrics", str(len(self.stats.missing_lyrics)))
+        table.add_row("Songs Missing Covers", str(len(self.stats.missing_covers)))
+        
+        # Format total size processed
+        size_gb = self.stats.total_size / (1024 ** 3)
+        table.add_row("Total Size Processed", f"{size_gb:.2f} GB")
+        
+        console.print(table)
+    
+    def _show_final_stats(self):
+        """Display final comprehensive processing statistics"""
+        logger = logging.getLogger("music_organizer")
+        
+        # Create detailed statistics table
+        table = Table(title="🎵 Final Results")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Count", style="green")
+        
+        table.add_row("Files Processed", str(self.stats.processed))
+        table.add_row("Files Skipped", str(self.stats.skipped))
+        table.add_row("Errors Encountered", str(self.stats.errors))
+        table.add_row("Duplicates Removed", str(self.stats.duplicates))
+        table.add_row("Total Lyrics Found & Embedded", str(self.stats.lyrics_found))
+        table.add_row("Total Covers Downloaded & Embedded", str(self.stats.covers_found))
         
         # Format total size processed
         size_gb = self.stats.total_size / (1024 ** 3)
@@ -1294,12 +1540,13 @@ class MusicOrganizer:
 @click.option('--output', '-o', type=click.Path(), help='Output folder')
 @click.option('--mode', type=click.Choice(['copy', 'move']), help='Operation mode')
 @click.option('--organize-by-artist', is_flag=True, help='Organize into artist folders')
+@click.option('--organize-by-language', is_flag=True, help='Organize by language folders')
 @click.option('--workers', type=int, help='Number of parallel workers')
 @click.option('--no-lyrics', is_flag=True, help='Skip lyrics fetching')
 @click.option('--no-covers', is_flag=True, help='Skip cover art fetching')
 @click.option('--config', is_flag=True, help='Show current configuration')
-def main(root, output, mode, organize_by_artist, workers, no_lyrics, no_covers, config):
-    """Enhanced Music File Organizer v2.3
+def main(root, output, mode, organize_by_artist, organize_by_language, workers, no_lyrics, no_covers, config):
+    """Enhanced Music File Organizer v2.4
     
     A comprehensive tool for organizing your music collection with advanced features
     including duplicate detection, metadata enhancement, and flexible organization.
@@ -1317,6 +1564,8 @@ def main(root, output, mode, organize_by_artist, workers, no_lyrics, no_covers, 
         app_config.mode = mode
     if organize_by_artist:
         app_config.organize_by_artist = True
+    if organize_by_language:
+        app_config.organize_by_language = True
     if workers:
         app_config.max_workers = workers
     if no_lyrics:
@@ -1327,11 +1576,13 @@ def main(root, output, mode, organize_by_artist, workers, no_lyrics, no_covers, 
     # Show configuration if requested
     if config:
         organization_mode = "Artist folders" if app_config.organize_by_artist else "Flat (all in output folder)"
+        language_mode = "Language-based folders" if app_config.organize_by_language else "Mixed languages"
         console.print(Panel(
             f"[cyan]Root Folder:[/cyan] {app_config.root_folder}\n"
             f"[cyan]Output Folder:[/cyan] {app_config.output_folder}\n"
             f"[cyan]Mode:[/cyan] {app_config.mode}\n"
             f"[cyan]Organization:[/cyan] {organization_mode}\n"
+            f"[cyan]Language Sort:[/cyan] {language_mode}\n"
             f"[cyan]Workers:[/cyan] {app_config.max_workers}\n"
             f"[cyan]Fetch Lyrics:[/cyan] {app_config.fetch_lyrics}\n"
             f"[cyan]Fetch Covers:[/cyan] {app_config.fetch_covers}",
@@ -1339,25 +1590,25 @@ def main(root, output, mode, organize_by_artist, workers, no_lyrics, no_covers, 
         ))
         return
     
-    # Interactive prompts for required settings
-    if not app_config.root_folder:
+    # ALWAYS ask for root folder
+    if not root:
         app_config.root_folder = Prompt.ask(
-            "Enter root music folder", 
+            "[bold cyan]Enter the root music folder path[/bold cyan]", 
             default=str(Path.cwd())
         )
     
-    # Interactive prompt for output folder with default
-    if not app_config.output_folder and not output:
-        default_output = Path(app_config.root_folder) / "output"
+    # ALWAYS ask for output folder with smart default
+    if not output:
+        default_output = str(Path(app_config.root_folder) / "output")
         app_config.output_folder = Prompt.ask(
-            "Where would you like to save organized files?",
-            default=str(default_output)
+            "[bold cyan]Enter the output folder path[/bold cyan]",
+            default=default_output
         )
     
     # Interactive mode selection (only if not provided via CLI)
     if not mode:
         app_config.mode = Prompt.ask(
-            "Keep originals (copy) or cut (move)?",
+            "[bold cyan]Keep originals (copy) or cut (move)?[/bold cyan]",
             choices=["copy", "move"],
             default="copy"
         )
@@ -1365,21 +1616,28 @@ def main(root, output, mode, organize_by_artist, workers, no_lyrics, no_covers, 
     # Interactive organization preference (only if not provided via CLI)
     if not organize_by_artist:
         app_config.organize_by_artist = Confirm.ask(
-            "Organize files into artist folders?",
+            "[bold cyan]Organize files into artist folders? [y/n][/bold cyan]",
+            default=False
+        )
+    
+    # Interactive language-based organization preference
+    if not organize_by_language:
+        app_config.organize_by_language = Confirm.ask(
+            "[bold cyan]Sort them based on language? [y/n][/bold cyan]",
             default=False
         )
     
     # Interactive lyrics fetching preference (only if not disabled via CLI)
     if not no_lyrics:
         app_config.fetch_lyrics = Confirm.ask(
-            "Fetch lyrics from online sources?",
+            "[bold cyan]Fetch lyrics from online sources? [y/n][/bold cyan]",
             default=True
         )
     
     # Interactive cover art fetching preference (only if not disabled via CLI)
     if not no_covers:
         app_config.fetch_covers = Confirm.ask(
-            "Fetch cover art from online sources?",
+            "[bold cyan]Fetch cover art from online sources? [y/n][/bold cyan]",
             default=True
         )
     
