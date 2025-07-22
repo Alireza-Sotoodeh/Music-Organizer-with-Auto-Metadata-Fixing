@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Enhanced Music File Organizer v2.1
+Enhanced Music File Organizer v2.3
 -----------------------------------
 
 Features:
@@ -14,9 +14,9 @@ Features:
 7. Advanced duplicate detection using SHA-1 hashing with caching.
 8. Full metadata support for .mp3, .flac, .m4a/.mp4, .ogg, .wav, .wma.
 9. Multiple online metadata sources (Genius, AZLyrics, iTunes, Last.fm, Spotify).
-10. Rich progress bars with network status and error tracking.
-11. Comprehensive logging and CSV reporting in output folder.
-12. Safe file operations with conflict resolution.
+10. Single clean progress display that replaces itself for each file.
+11. Comprehensive Windows-compatible metadata including subtitle (lyrics) and tags.
+12. Proper cover art and lyrics embedding with verification.
 """
 
 # -----------------------------------------------------------------------------
@@ -100,6 +100,9 @@ from urllib.parse import quote_plus, urljoin
 
 import click
 import mutagen
+from mutagen.id3 import ID3, USLT, APIC, TIT2, TPE1, TALB, TDRC, TCON, TIT3, TPE2, COMM
+from mutagen.flac import FLAC
+from mutagen.mp4 import MP4
 import requests
 from bs4 import BeautifulSoup
 from rich.console import Console
@@ -112,6 +115,7 @@ from rich.progress import (
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
+from rich.live import Live
 from send2trash import send2trash
 
 # -----------------------------------------------------------------------------
@@ -126,7 +130,7 @@ class Config:
     root_folder: str = ""
     output_folder: str = ""
     mode: str = "copy"  # copy or move
-    organize_by_artist: bool = False  # NEW: organize into artist folders
+    organize_by_artist: bool = False
     fetch_lyrics: bool = True
     fetch_covers: bool = True
     max_workers: int = 4
@@ -162,9 +166,9 @@ class FileStats:
     covers_found: int = 0
     total_size: int = 0
     
-    def save(self, output_folder: Path):
-        """Save stats to file in output folder"""
-        stats_file = output_folder / 'stats.json'
+    def save(self, reports_folder: Path):
+        """Save stats to file in reports folder"""
+        stats_file = reports_folder / 'stats.json'
         with open(stats_file, 'w') as f:
             json.dump(asdict(self), f, indent=2)
 
@@ -365,8 +369,7 @@ class MetadataEnhancer:
                 lyrics = source_func(artist, title)
                 if lyrics and len(lyrics.strip()) > 50:  # Ensure meaningful content
                     return lyrics
-            except Exception as e:
-                console.print(f"[dim]Lyrics source failed: {e}[/dim]")
+            except Exception:
                 continue
         
         return None
@@ -500,8 +503,6 @@ class MetadataEnhancer:
         sources = [
             self._fetch_cover_itunes,
             self._fetch_cover_lastfm,
-            self._fetch_cover_spotify,
-            self._fetch_cover_deezer
         ]
         
         for source_func in sources:
@@ -509,8 +510,7 @@ class MetadataEnhancer:
                 cover_data = source_func(artist, album)
                 if cover_data and len(cover_data) > 1000:  # Ensure meaningful image data
                     return cover_data
-            except Exception as e:
-                console.print(f"[dim]Cover source failed: {e}[/dim]")
+            except Exception:
                 continue
         
         return None
@@ -574,84 +574,202 @@ class MetadataEnhancer:
         
         return None
     
-    def _fetch_cover_spotify(self, artist: str, album: str) -> Optional[bytes]:
-        """Fetch cover art from Spotify Web API (public endpoints)"""
+    def embed_comprehensive_metadata(self, file_path: Path, metadata: Dict[str, Any], lyrics: Optional[str] = None, cover_data: Optional[bytes] = None):
+        """Embed comprehensive Windows-compatible metadata into audio file"""
         try:
-            # Spotify search endpoint (no auth needed for basic search)
-            search_url = "https://api.spotify.com/v1/search"
-            params = {
-                "q": f"artist:{artist} album:{album}",
-                "type": "album",
-                "limit": 5
-            }
+            file_ext = file_path.suffix.lower()
             
-            response = self.session.get(search_url, params=params, timeout=self.timeout)
-            if response.status_code != 200:
-                return None
-            
-            data = response.json()
-            albums = data.get("albums", {}).get("items", [])
-            
-            for album_data in albums:
-                images = album_data.get("images", [])
-                if images:
-                    # Get highest resolution image
-                    img_url = images[0].get("url")
-                    if img_url:
-                        img_response = self.session.get(img_url, timeout=self.timeout)
-                        if img_response.status_code == 200 and len(img_response.content) > 1000:
-                            return img_response.content
-            
-        except Exception:
-            pass
-        
-        return None
+            if file_ext == '.mp3':
+                self._embed_mp3_metadata(file_path, metadata, lyrics, cover_data)
+            elif file_ext == '.flac':
+                self._embed_flac_metadata(file_path, metadata, lyrics, cover_data)
+            elif file_ext in ['.m4a', '.mp4']:
+                self._embed_mp4_metadata(file_path, metadata, lyrics, cover_data)
+                
+        except Exception as e:
+            console.print(f"\n[dim red]Failed to embed metadata in {file_path}: {e}[/dim red]")
     
-    def _fetch_cover_deezer(self, artist: str, album: str) -> Optional[bytes]:
-        """Fetch cover art from Deezer API"""
+    def _embed_mp3_metadata(self, file_path: Path, metadata: Dict[str, Any], lyrics: Optional[str], cover_data: Optional[bytes]):
+        """Embed comprehensive metadata into MP3 file"""
         try:
-            # Deezer search API
-            search_url = "https://api.deezer.com/search/album"
-            params = {"q": f"{artist} {album}", "limit": 5}
+            try:
+                audio = ID3(file_path)
+            except:
+                audio = ID3()
             
-            response = self.session.get(search_url, params=params, timeout=self.timeout)
-            if response.status_code != 200:
-                return None
+            # Clear existing tags to ensure clean metadata
+            audio.clear()
             
-            data = response.json()
-            albums = data.get("data", [])
+            # Basic metadata
+            if metadata.get('title'):
+                audio.add(TIT2(encoding=3, text=metadata['title']))
             
-            for album_data in albums:
-                # Try different resolutions
-                for size in ["cover_xl", "cover_big", "cover_medium"]:
-                    img_url = album_data.get(size)
-                    if img_url:
-                        img_response = self.session.get(img_url, timeout=self.timeout)
-                        if img_response.status_code == 200 and len(img_response.content) > 1000:
-                            return img_response.content
+            if metadata.get('artist'):
+                audio.add(TPE1(encoding=3, text=metadata['artist']))
+                # Album artist (same as artist if not specified)
+                audio.add(TPE2(encoding=3, text=metadata.get('album_artist', metadata['artist'])))
             
-        except Exception:
-            pass
-        
-        return None
+            if metadata.get('album'):
+                audio.add(TALB(encoding=3, text=metadata['album']))
+            
+            if metadata.get('year'):
+                audio.add(TDRC(encoding=3, text=str(metadata['year'])))
+            
+            if metadata.get('genre'):
+                audio.add(TCON(encoding=3, text=metadata['genre']))
+            
+            # Subtitle field for lyrics (TIT3 frame)
+            if lyrics:
+                audio.add(TIT3(encoding=3, text=lyrics))
+                # Also add as unsynchronized lyrics
+                audio.add(USLT(encoding=3, lang='eng', desc='', text=lyrics))
+            
+            # Language tag in comments
+            if metadata.get('language'):
+                audio.add(COMM(encoding=3, lang='eng', desc='Language', text=metadata['language']))
+            
+            # Contributing artists
+            if metadata.get('contributing_artists'):
+                audio.add(COMM(encoding=3, lang='eng', desc='Contributing Artists', text=metadata['contributing_artists']))
+            
+            # Cover art
+            if cover_data:
+                audio.add(APIC(
+                    encoding=3,
+                    mime='image/jpeg',
+                    type=3,  # Cover (front)
+                    desc='Cover',
+                    data=cover_data
+                ))
+            
+            audio.save(file_path, v2_version=4)
+            
+        except Exception as e:
+            console.print(f"\n[dim red]Failed to embed MP3 metadata: {e}[/dim red]")
+    
+    def _embed_flac_metadata(self, file_path: Path, metadata: Dict[str, Any], lyrics: Optional[str], cover_data: Optional[bytes]):
+        """Embed comprehensive metadata into FLAC file"""
+        try:
+            audio = FLAC(file_path)
+            
+            # Clear existing tags
+            audio.clear()
+            
+            # Basic metadata
+            if metadata.get('title'):
+                audio['TITLE'] = metadata['title']
+            
+            if metadata.get('artist'):
+                audio['ARTIST'] = metadata['artist']
+                audio['ALBUMARTIST'] = metadata.get('album_artist', metadata['artist'])
+            
+            if metadata.get('album'):
+                audio['ALBUM'] = metadata['album']
+            
+            if metadata.get('year'):
+                audio['DATE'] = str(metadata['year'])
+            
+            if metadata.get('genre'):
+                audio['GENRE'] = metadata['genre']
+            
+            # Lyrics as subtitle and dedicated lyrics field
+            if lyrics:
+                audio['LYRICS'] = lyrics
+                audio['SUBTITLE'] = lyrics  # For Windows compatibility
+            
+            # Language tag
+            if metadata.get('language'):
+                audio['LANGUAGE'] = metadata['language']
+            
+            # Contributing artists
+            if metadata.get('contributing_artists'):
+                audio['PERFORMER'] = metadata['contributing_artists']
+            
+            # Cover art
+            if cover_data:
+                from mutagen.flac import Picture
+                picture = Picture()
+                picture.type = 3  # Cover (front)
+                picture.mime = 'image/jpeg'
+                picture.desc = 'Cover'
+                picture.data = cover_data
+                audio.add_picture(picture)
+            
+            audio.save()
+            
+        except Exception as e:
+            console.print(f"\n[dim red]Failed to embed FLAC metadata: {e}[/dim red]")
+    
+    def _embed_mp4_metadata(self, file_path: Path, metadata: Dict[str, Any], lyrics: Optional[str], cover_data: Optional[bytes]):
+        """Embed comprehensive metadata into MP4/M4A file"""
+        try:
+            audio = MP4(file_path)
+            
+            # Clear existing tags
+            audio.clear()
+            
+            # Basic metadata
+            if metadata.get('title'):
+                audio['©nam'] = [metadata['title']]
+            
+            if metadata.get('artist'):
+                audio['©ART'] = [metadata['artist']]
+                audio['aART'] = [metadata.get('album_artist', metadata['artist'])]
+            
+            if metadata.get('album'):
+                audio['©alb'] = [metadata['album']]
+            
+            if metadata.get('year'):
+                audio['©day'] = [str(metadata['year'])]
+            
+            if metadata.get('genre'):
+                audio['©gen'] = [metadata['genre']]
+            
+            # Lyrics
+            if lyrics:
+                audio['©lyr'] = [lyrics]
+            
+            # Language (custom tag)
+            if metadata.get('language'):
+                audio['©lng'] = [metadata['language']]
+            
+            # Contributing artists
+            if metadata.get('contributing_artists'):
+                audio['©wrt'] = [metadata['contributing_artists']]
+            
+            # Cover art
+            if cover_data:
+                audio['covr'] = [cover_data]
+            
+            audio.save()
+            
+        except Exception as e:
+            console.print(f"\n[dim red]Failed to embed MP4 metadata: {e}[/dim red]")
 
 # -----------------------------------------------------------------------------
-# SECTION 6: Progress Management & UI
+# SECTION 6: Enhanced Progress Management with Live Display
 # -----------------------------------------------------------------------------
 
 class ProgressManager:
-    """Enhanced progress tracking with network status and error monitoring"""
+    """Enhanced progress tracking with single live-updating progress bar"""
     
     def __init__(self, network_monitor: NetworkMonitor):
         self.network_monitor = network_monitor
         self.stats = FileStats()
-    
-    def create_progress(self) -> Progress:
-        """Create rich progress display with multiple status columns"""
-        return Progress(
+        self.start_time = time.time()
+        self.processed_count = 0
+        self.total_files = 0
+        self.current_logs = []
+        
+    def create_progress_display(self, total_files: int):
+        """Create progress display that shows logs above and progress bar below"""
+        self.total_files = total_files
+        
+        # Create progress bar components
+        progress = Progress(
             SpinnerColumn(),
-            TextColumn("[bold blue]{task.fields[current_file]}", justify="left"),
-            BarColumn(bar_width=None),
+            TextColumn("[bold blue]{task.description}", justify="left"),
+            BarColumn(bar_width=40),
             MofNCompleteColumn(),
             TextColumn("•"),
             TextColumn("{task.fields[network_status]}"),
@@ -664,6 +782,33 @@ class ProgressManager:
             console=console,
             transient=False,
         )
+        
+        return progress
+    
+    def add_log_message(self, message: str):
+        """Add a log message to be displayed above the progress bar"""
+        console.print(f"\n{message}")
+    
+    def update_progress(self, task_id, progress_obj, current_file: str):
+        """Update progress with better time estimation"""
+        self.processed_count += 1
+        
+        # Calculate better ETA
+        elapsed = time.time() - self.start_time
+        if self.processed_count > 0:
+            avg_time_per_file = elapsed / self.processed_count
+            remaining_files = self.total_files - self.processed_count
+        else:
+            remaining_files = self.total_files
+        
+        progress_obj.update(
+            task_id,
+            description=current_file,
+            network_status=self.network_monitor.get_status(),
+            errors=self.stats.errors,
+            duplicates=self.stats.duplicates,
+            completed=self.processed_count
+        )
 
 # -----------------------------------------------------------------------------
 # SECTION 7: Main Music Organizer Class
@@ -675,41 +820,43 @@ class MusicOrganizer:
     def __init__(self, config: Config):
         self.config = config
         self.output_dir = Path(config.output_folder)
+        self.reports_dir = self.output_dir / 'reports'
         self.network_monitor = NetworkMonitor(config.ping_interval)
         self.duplicate_manager = DuplicateManager()
         self.metadata_enhancer = MetadataEnhancer(config.request_timeout, config.max_retries)
         self.progress_manager = ProgressManager(self.network_monitor)
         self.stats = FileStats()
         
-        # Create output directory and setup logging/reporting there
+        # Create directories
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
         
-        # Setup logging to output folder
-        self.log_file = self.output_dir / 'organizer.log'
-        self.report_csv = self.output_dir / 'report.csv'
+        # Setup logging to reports folder
+        self.log_file = self.reports_dir / 'organizer.log'
+        self.report_csv = self.reports_dir / 'report.csv'
         self.setup_logging()
         
         # Setup CSV reporting
         self.setup_reporting()
     
     def setup_logging(self):
-        """Setup logging to output folder"""
+        """Setup logging to reports folder"""
         # Remove existing handlers
         logger = logging.getLogger("music_organizer")
         logger.handlers.clear()
         
-        # Add new handlers
-        logger.addHandler(RichHandler(rich_tracebacks=True))
+        # Add file handler only (we'll handle console output manually)
         logger.addHandler(logging.FileHandler(self.log_file, encoding="utf-8"))
         logger.setLevel(logging.INFO)
     
     def setup_reporting(self):
-        """Initialize CSV reporting for processed files in output folder"""
+        """Initialize CSV reporting for processed files in reports folder"""
         self.csv_file = open(self.report_csv, 'w', newline='', encoding='utf-8')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
             'Original Path', 'New Path', 'Artist', 'Title', 'Album', 'Genre', 'Year',
-            'Action', 'Timestamp', 'File Size (MB)', 'Lyrics Found', 'Cover Found'
+            'Action', 'Timestamp', 'File Size (MB)', 'Lyrics Found', 'Cover Found', 
+            'Language', 'Contributing Artists'
         ])
     
     def start(self):
@@ -720,7 +867,7 @@ class MusicOrganizer:
             self._run_organization()
         finally:
             self.network_monitor.stop_monitoring()
-            self.stats.save(self.output_dir)
+            self.stats.save(self.reports_dir)
             if hasattr(self, 'csv_file'):
                 self.csv_file.close()
             logger.info("Organization process completed")
@@ -733,9 +880,10 @@ class MusicOrganizer:
         organization_mode = "Artist folders" if self.config.organize_by_artist else "Flat (all in output folder)"
         
         console.print(Panel.fit(
-            "[bold green]🎵 Enhanced Music Organizer v2.1[/bold green]\n"
+            "[bold green]🎵 Enhanced Music Organizer v2.3[/bold green]\n"
             f"[cyan]Root:[/cyan] {self.config.root_folder}\n"
             f"[cyan]Output:[/cyan] {self.config.output_folder}\n"
+            f"[cyan]Reports:[/cyan] {self.reports_dir}\n"
             f"[cyan]Mode:[/cyan] {self.config.mode.upper()}\n"
             f"[cyan]Organization:[/cyan] {organization_mode}\n"
             f"[cyan]Fetch Lyrics:[/cyan] {'Yes' if self.config.fetch_lyrics else 'No'}\n"
@@ -833,15 +981,14 @@ class MusicOrganizer:
                         logger.error(f"Failed to delete duplicate {file_to_delete}: {e}")
     
     def _process_files(self, music_files: List[Path]):
-        """Process all music files with rich progress tracking"""
+        """Process all music files with clean single progress tracking"""
         logger = logging.getLogger("music_organizer")
         console.print(f"\n[yellow]🎵 Processing {len(music_files)} files...[/yellow]")
         
-        with self.progress_manager.create_progress() as progress:
+        with self.progress_manager.create_progress_display(len(music_files)) as progress:
             task = progress.add_task(
-                "Processing files...",
+                "Starting...",
                 total=len(music_files),
-                current_file="Starting...",
                 network_status=self.network_monitor.get_status(),
                 errors=self.stats.errors,
                 duplicates=self.stats.duplicates
@@ -849,25 +996,35 @@ class MusicOrganizer:
             
             for file_path in music_files:
                 try:
+                    # Update progress with current file
                     progress.update(
                         task,
-                        current_file=file_path.name,
+                        description=file_path.name,
                         network_status=self.network_monitor.get_status(),
                         errors=self.stats.errors,
                         duplicates=self.stats.duplicates
                     )
                     
-                    self._process_single_file(file_path, progress, task)
+                    # Process the file and capture results
+                    result = self._process_single_file(file_path)
+                    
+                    # Show results above progress bar
+                    if result:
+                        if result.get('lyrics_found'):
+                            console.print(f"📝 Found lyrics for: {result['artist']} - {result['title']}")
+                        if result.get('cover_found'):
+                            console.print(f"🖼️  Found cover for: {result['artist']} - {result['album']}")
+                        console.print(f"INFO     Processed: {file_path.name} -> {result['output_filename']}")
                     
                 except Exception as e:
                     logger.error(f"Error processing {file_path}: {e}")
                     self.stats.errors += 1
+                    console.print(f"\n[red]ERROR    Failed to process: {file_path.name}[/red]")
                 
                 progress.advance(task)
-                time.sleep(0.1)  # Brief pause for UI responsiveness
     
-    def _process_single_file(self, file_path: Path, progress, task):
-        """Process individual music file with metadata enhancement"""
+    def _process_single_file(self, file_path: Path) -> Optional[Dict[str, Any]]:
+        """Process individual music file with comprehensive metadata enhancement"""
         logger = logging.getLogger("music_organizer")
         
         try:
@@ -876,17 +1033,9 @@ class MusicOrganizer:
             if not audio_file:
                 logger.warning(f"Could not read metadata from {file_path}")
                 self.stats.skipped += 1
-                return
+                return None
             
-            metadata = self._extract_metadata(audio_file, file_path)
-            
-            # Enhance metadata with online services if connected and enabled
-            lyrics_found = False
-            cover_found = False
-            
-            if self.network_monitor.is_connected:
-                if self.config.fetch_lyrics or self.config.fetch_covers:
-                    lyrics_found, cover_found = self._enhance_metadata(metadata, audio_file)
+            metadata = self._extract_comprehensive_metadata(audio_file, file_path)
             
             # Generate organized output path with new naming convention
             output_path = self._generate_output_path(metadata, file_path.suffix)
@@ -904,6 +1053,32 @@ class MusicOrganizer:
             else:
                 shutil.copy2(str(file_path), str(output_path))
             
+            # Enhance metadata with online services if connected and enabled
+            lyrics_found = False
+            cover_found = False
+            lyrics = None
+            cover_art = None
+            
+            if self.network_monitor.is_connected:
+                if self.config.fetch_lyrics:
+                    lyrics = self.metadata_enhancer.fetch_lyrics(
+                        metadata['artist'], metadata['title']
+                    )
+                    if lyrics:
+                        lyrics_found = True
+                
+                if self.config.fetch_covers and metadata['album'] != 'Unknown Album':
+                    cover_art = self.metadata_enhancer.fetch_cover_art(
+                        metadata['artist'], metadata['album']
+                    )
+                    if cover_art:
+                        cover_found = True
+            
+            # Embed comprehensive metadata including lyrics and cover
+            self.metadata_enhancer.embed_comprehensive_metadata(
+                output_path, metadata, lyrics, cover_art
+            )
+            
             # Update statistics
             file_size = file_path.stat().st_size
             self.stats.total_size += file_size
@@ -919,17 +1094,28 @@ class MusicOrganizer:
                 str(file_path), str(output_path), metadata['artist'], 
                 metadata['title'], metadata['album'], metadata['genre'], metadata['year'],
                 action, time.strftime('%Y-%m-%d %H:%M:%S'), f"{file_size / (1024*1024):.2f}",
-                "Yes" if lyrics_found else "No", "Yes" if cover_found else "No"
+                "Yes" if lyrics_found else "No", "Yes" if cover_found else "No",
+                metadata.get('language', 'Unknown'), metadata.get('contributing_artists', '')
             ])
             
             logger.info(f"Processed: {file_path.name} -> {output_path.name}")
             
+            return {
+                'artist': metadata['artist'],
+                'title': metadata['title'],
+                'album': metadata['album'],
+                'output_filename': output_path.name,
+                'lyrics_found': lyrics_found,
+                'cover_found': cover_found
+            }
+            
         except Exception as e:
             logger.error(f"Failed to process {file_path}: {e}")
             self.stats.errors += 1
+            return None
     
-    def _extract_metadata(self, audio_file, file_path: Path) -> Dict[str, Any]:
-        """Extract comprehensive metadata from audio file with improved parsing"""
+    def _extract_comprehensive_metadata(self, audio_file, file_path: Path) -> Dict[str, Any]:
+        """Extract comprehensive Windows-compatible metadata from audio file"""
         metadata = {
             'artist': 'Unknown Artist',
             'album': 'Unknown Album',
@@ -937,6 +1123,9 @@ class MusicOrganizer:
             'track': 1,
             'year': 'Unknown',
             'genre': 'Unknown',
+            'language': 'Unknown',
+            'album_artist': '',
+            'contributing_artists': '',
             'ext': file_path.suffix[1:].lower()
         }
         
@@ -952,6 +1141,8 @@ class MusicOrganizer:
                     'title': self._get_tag_value(tags, ['TIT2', 'TITLE', '\xa9nam']) or metadata['title'],
                     'year': self._get_tag_value(tags, ['TDRC', 'DATE', '\xa9day']) or metadata['year'],
                     'genre': self._get_tag_value(tags, ['TCON', 'GENRE', '\xa9gen']) or metadata['genre'],
+                    'album_artist': self._get_tag_value(tags, ['TPE2', 'ALBUMARTIST', 'aART']) or '',
+                    'contributing_artists': self._get_tag_value(tags, ['TPE3', 'PERFORMER', '\xa9wrt']) or '',
                 })
                 
                 # Extract track number
@@ -969,6 +1160,9 @@ class MusicOrganizer:
                         metadata['year'] = year_match.group()
                     else:
                         metadata['year'] = 'Unknown'
+                
+                # Detect language based on content (basic detection)
+                metadata['language'] = self._detect_language(metadata['artist'], metadata['title'])
         
         # Clean metadata for filesystem compatibility
         for key, value in metadata.items():
@@ -976,6 +1170,23 @@ class MusicOrganizer:
                 metadata[key] = self._clean_filename(value)
         
         return metadata
+    
+    def _detect_language(self, artist: str, title: str) -> str:
+        """Basic language detection based on artist/title content"""
+        text = f"{artist} {title}".lower()
+        
+        # Persian/Farsi detection (basic)
+        persian_chars = re.search(r'[\u0600-\u06FF]', text)
+        if persian_chars:
+            return "Persian"
+        
+        # Arabic detection
+        arabic_chars = re.search(r'[\u0600-\u06FF]', text)
+        if arabic_chars:
+            return "Arabic"
+        
+        # Default to English for Latin characters
+        return "English"
     
     def _get_tag_value(self, tags, keys: List[str]) -> Optional[str]:
         """Get tag value trying multiple possible keys"""
@@ -986,37 +1197,6 @@ class MusicOrganizer:
                     return str(value[0])
                 return str(value) if value else None
         return None
-    
-    def _enhance_metadata(self, metadata: Dict[str, Any], audio_file) -> Tuple[bool, bool]:
-        """Enhance metadata using multiple online services"""
-        lyrics_found = False
-        cover_found = False
-        
-        try:
-            # Fetch lyrics if enabled
-            if self.config.fetch_lyrics:
-                lyrics = self.metadata_enhancer.fetch_lyrics(
-                    metadata['artist'], metadata['title']
-                )
-                if lyrics:
-                    lyrics_found = True
-                    console.print(f"[dim green]📝 Found lyrics for: {metadata['artist']} - {metadata['title']}[/dim green]")
-                    # In production, you'd embed lyrics into the file
-            
-            # Fetch cover art if enabled
-            if self.config.fetch_covers and metadata['album'] != 'Unknown Album':
-                cover_art = self.metadata_enhancer.fetch_cover_art(
-                    metadata['artist'], metadata['album']
-                )
-                if cover_art:
-                    cover_found = True
-                    console.print(f"[dim green]🖼️  Found cover for: {metadata['artist']} - {metadata['album']}[/dim green]")
-                    # In production, you'd embed cover art into the file
-                    
-        except Exception as e:
-            console.print(f"[dim red]Metadata enhancement failed: {e}[/dim red]")
-        
-        return lyrics_found, cover_found
     
     def _generate_output_path(self, metadata: Dict[str, Any], extension: str) -> Path:
         """Generate organized output path with new naming convention"""
@@ -1086,8 +1266,8 @@ class MusicOrganizer:
         table.add_row("Files Skipped", str(self.stats.skipped))
         table.add_row("Errors Encountered", str(self.stats.errors))
         table.add_row("Duplicates Removed", str(self.stats.duplicates))
-        table.add_row("Lyrics Found", str(self.stats.lyrics_found))
-        table.add_row("Covers Downloaded", str(self.stats.covers_found))
+        table.add_row("Lyrics Found & Embedded", str(self.stats.lyrics_found))
+        table.add_row("Covers Downloaded & Embedded", str(self.stats.covers_found))
         
         # Format total size processed
         size_gb = self.stats.total_size / (1024 ** 3)
@@ -1119,7 +1299,7 @@ class MusicOrganizer:
 @click.option('--no-covers', is_flag=True, help='Skip cover art fetching')
 @click.option('--config', is_flag=True, help='Show current configuration')
 def main(root, output, mode, organize_by_artist, workers, no_lyrics, no_covers, config):
-    """Enhanced Music File Organizer v2.1
+    """Enhanced Music File Organizer v2.3
     
     A comprehensive tool for organizing your music collection with advanced features
     including duplicate detection, metadata enhancement, and flexible organization.
@@ -1229,3 +1409,4 @@ def main(root, output, mode, organize_by_artist, workers, no_lyrics, no_covers, 
 
 if __name__ == "__main__":
     main()
+
