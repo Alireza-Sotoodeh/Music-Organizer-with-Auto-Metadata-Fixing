@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Enhanced Music File Organizer v2.0
+Enhanced Music File Organizer v2.1
 -----------------------------------
 
 Features:
-1. Interactive prompts for root & output folders (defaults to root/output), copy/move mode.
-2. Automatic dependency installation with minimal terminal output.
-3. Network connectivity monitoring with real-time ping display.
-4. Advanced duplicate detection using SHA-1 hashing with caching.
-5. Full metadata support for .mp3, .flac, .m4a/.mp4, .ogg, .wav, .wma.
-6. Online metadata enhancement (lyrics from Genius, covers from iTunes/Last.fm).
-7. Rich progress bars with network status and error tracking.
-8. Comprehensive logging and CSV reporting.
-9. Multiple organization patterns and flexible configuration.
-10. Safe file operations with conflict resolution.
+1. Interactive prompts for root & output folders, copy/move mode, organization type.
+2. Flexible file naming: "Artist - Title [Album]" or "Artist - Title" if no album.
+3. Optional folder organization by artist (default: flat in output folder).
+4. Interactive lyrics/cover fetching options (default: yes for both).
+5. Automatic dependency installation with minimal terminal output.
+6. Network connectivity monitoring with real-time ping display.
+7. Advanced duplicate detection using SHA-1 hashing with caching.
+8. Full metadata support for .mp3, .flac, .m4a/.mp4, .ogg, .wav, .wma.
+9. Multiple online metadata sources (Genius, AZLyrics, iTunes, Last.fm, Spotify).
+10. Rich progress bars with network status and error tracking.
+11. Comprehensive logging and CSV reporting in output folder.
+12. Safe file operations with conflict resolution.
 """
 
 # -----------------------------------------------------------------------------
@@ -33,8 +35,6 @@ APP_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = APP_DIR / 'config.json'
 PROGRESS_FILE = APP_DIR / 'progress.json'
 STATS_FILE = APP_DIR / 'stats.json'
-LOG_FILE = APP_DIR / 'organizer.log'
-REPORT_CSV = APP_DIR / 'report.csv'
 
 def check_and_install_libraries():
     """Check for required libraries and install them if missing"""
@@ -43,7 +43,9 @@ def check_and_install_libraries():
         'rich': 'rich', 
         'mutagen': 'mutagen',
         'requests': 'requests',
-        'send2trash': 'send2trash'
+        'send2trash': 'send2trash',
+        'beautifulsoup4': 'beautifulsoup4',
+        'lxml': 'lxml'
     }
     
     missing_libraries = []
@@ -51,7 +53,10 @@ def check_and_install_libraries():
     # Check which libraries are missing
     for lib_name, pip_name in required_libraries.items():
         try:
-            importlib.import_module(lib_name)
+            if lib_name == 'beautifulsoup4':
+                importlib.import_module('bs4')
+            else:
+                importlib.import_module(lib_name)
         except ImportError:
             missing_libraries.append(pip_name)
     
@@ -86,15 +91,17 @@ import sqlite3
 import threading
 import time
 import csv
+import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple, Set, Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
 
 import click
 import mutagen
 import requests
+from bs4 import BeautifulSoup
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
@@ -111,18 +118,6 @@ from send2trash import send2trash
 # SECTION 2: Configuration & Data Classes
 # -----------------------------------------------------------------------------
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[
-        RichHandler(rich_tracebacks=True),
-        logging.FileHandler(LOG_FILE, encoding="utf-8")
-    ]
-)
-logger = logging.getLogger("music_organizer")
-
 console = Console()
 
 @dataclass
@@ -131,8 +126,7 @@ class Config:
     root_folder: str = ""
     output_folder: str = ""
     mode: str = "copy"  # copy or move
-    pattern: str = "artist_album"
-    auto_delete_duplicates: bool = False
+    organize_by_artist: bool = False  # NEW: organize into artist folders
     fetch_lyrics: bool = True
     fetch_covers: bool = True
     max_workers: int = 4
@@ -149,7 +143,7 @@ class Config:
                     data = json.load(f)
                     return cls(**data)
             except Exception as e:
-                logger.warning(f"Failed to load config: {e}")
+                console.print(f"[yellow]Failed to load config: {e}[/yellow]")
         return cls()
     
     def save(self):
@@ -168,9 +162,10 @@ class FileStats:
     covers_found: int = 0
     total_size: int = 0
     
-    def save(self):
-        """Save stats to file"""
-        with open(STATS_FILE, 'w') as f:
+    def save(self, output_folder: Path):
+        """Save stats to file in output folder"""
+        stats_file = output_folder / 'stats.json'
+        with open(stats_file, 'w') as f:
             json.dump(asdict(self), f, indent=2)
 
 # -----------------------------------------------------------------------------
@@ -278,7 +273,7 @@ class DuplicateManager:
             return file_hash
             
         except Exception as e:
-            logger.error(f"Hash calculation failed for {file_path}: {e}")
+            console.print(f"[red]Hash calculation failed for {file_path}: {e}[/red]")
             return None
     
     def _get_cached_hash(self, file_path: Path) -> Optional[str]:
@@ -315,7 +310,7 @@ class DuplicateManager:
             conn.close()
             
         except Exception as e:
-            logger.debug(f"Failed to cache hash: {e}")
+            console.print(f"[yellow]Failed to cache hash: {e}[/yellow]")
     
     def find_duplicates(self, files: List[Path], max_workers: int = 4) -> Dict[str, List[Path]]:
         """Find duplicate files using parallel processing"""
@@ -334,60 +329,197 @@ class DuplicateManager:
                     if file_hash:
                         duplicates[file_hash].append(file_path)
                 except Exception as e:
-                    logger.error(f"Error processing {file_path}: {e}")
+                    console.print(f"[red]Error processing {file_path}: {e}[/red]")
         
         return {k: v for k, v in duplicates.items() if len(v) > 1}
 
 # -----------------------------------------------------------------------------
-# SECTION 5: Metadata Enhancement & Online Services
+# SECTION 5: Enhanced Metadata Services (Multiple Sources)
 # -----------------------------------------------------------------------------
 
 class MetadataEnhancer:
-    """Enhance metadata using online services (Genius, Last.fm, iTunes)"""
+    """Enhanced metadata services with multiple sources for maximum coverage"""
     
     def __init__(self, timeout: int = 15, max_retries: int = 3):
         self.timeout = timeout
         self.max_retries = max_retries
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'MusicOrganizer/2.0 (https://github.com/musicorganizer)'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
     
     def fetch_lyrics(self, artist: str, title: str) -> Optional[str]:
-        """Fetch lyrics from Genius API (requires API key)"""
+        """Fetch lyrics from multiple sources with fallback"""
         if not artist or not title:
             return None
-            
+        
+        # Try multiple sources in order of preference
+        sources = [
+            self._fetch_lyrics_azlyrics,
+            self._fetch_lyrics_genius,
+            self._fetch_lyrics_lyricscom
+        ]
+        
+        for source_func in sources:
+            try:
+                lyrics = source_func(artist, title)
+                if lyrics and len(lyrics.strip()) > 50:  # Ensure meaningful content
+                    return lyrics
+            except Exception as e:
+                console.print(f"[dim]Lyrics source failed: {e}[/dim]")
+                continue
+        
+        return None
+    
+    def _fetch_lyrics_azlyrics(self, artist: str, title: str) -> Optional[str]:
+        """Fetch lyrics from AZLyrics (web scraping)"""
         try:
-            # Clean up artist and title for search
-            artist = self._clean_string(artist)
-            title = self._clean_string(title)
+            # Clean artist and title for URL
+            artist_clean = re.sub(r'[^a-zA-Z0-9]', '', artist.lower())
+            title_clean = re.sub(r'[^a-zA-Z0-9]', '', title.lower())
             
-            # Note: This is a placeholder implementation
-            # In production, you would need a Genius API key
-            search_url = "https://api.genius.com/search"
-            params = {"q": f"{artist} {title}"}
+            url = f"https://www.azlyrics.com/lyrics/{artist_clean}/{title_clean}.html"
             
-            # Simulated response for demo
-            logger.debug(f"Would fetch lyrics for: {artist} - {title}")
-            return None  # Return None since we don't have real API implementation
+            response = self.session.get(url, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
             
-        except Exception as e:
-            logger.debug(f"Lyrics fetch failed: {e}")
-            return None
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Find lyrics div (AZLyrics specific structure)
+            lyrics_div = soup.find('div', class_='')
+            if lyrics_div and 'Sorry about that' not in lyrics_div.get_text():
+                lyrics = lyrics_div.get_text().strip()
+                return lyrics if lyrics else None
+            
+        except Exception:
+            pass
+        
+        return None
+    
+    def _fetch_lyrics_genius(self, artist: str, title: str) -> Optional[str]:
+        """Fetch lyrics from Genius (web scraping - no API key needed)"""
+        try:
+            # Search for the song
+            search_url = "https://genius.com/api/search/multi"
+            params = {"per_page": "5", "q": f"{artist} {title}"}
+            
+            response = self.session.get(search_url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            songs = data.get('response', {}).get('sections', [])
+            
+            for section in songs:
+                if section.get('type') == 'song':
+                    hits = section.get('hits', [])
+                    if hits:
+                        song_url = hits[0].get('result', {}).get('url')
+                        if song_url:
+                            return self._scrape_genius_lyrics(song_url)
+            
+        except Exception:
+            pass
+        
+        return None
+    
+    def _scrape_genius_lyrics(self, song_url: str) -> Optional[str]:
+        """Scrape lyrics from Genius song page"""
+        try:
+            response = self.session.get(song_url, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Genius lyrics container
+            lyrics_container = soup.find('div', {'data-lyrics-container': 'true'})
+            if lyrics_container:
+                return lyrics_container.get_text(separator='\n').strip()
+            
+            # Alternative selector
+            lyrics_div = soup.find('div', class_=re.compile('lyrics|Lyrics'))
+            if lyrics_div:
+                return lyrics_div.get_text(separator='\n').strip()
+            
+        except Exception:
+            pass
+        
+        return None
+    
+    def _fetch_lyrics_lyricscom(self, artist: str, title: str) -> Optional[str]:
+        """Fetch lyrics from Lyrics.com"""
+        try:
+            # Search URL
+            search_url = "https://www.lyrics.com/serp.php"
+            params = {"st": f"{artist} {title}", "qtype": "2"}
+            
+            response = self.session.get(search_url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Find first result link
+            result_link = soup.find('a', href=re.compile(r'/lyric/'))
+            if result_link:
+                lyrics_url = urljoin("https://www.lyrics.com", result_link['href'])
+                return self._scrape_lyricscom_lyrics(lyrics_url)
+            
+        except Exception:
+            pass
+        
+        return None
+    
+    def _scrape_lyricscom_lyrics(self, lyrics_url: str) -> Optional[str]:
+        """Scrape lyrics from Lyrics.com song page"""
+        try:
+            response = self.session.get(lyrics_url, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Lyrics.com specific container
+            lyrics_div = soup.find('pre', id='lyric-body-text')
+            if lyrics_div:
+                return lyrics_div.get_text().strip()
+            
+        except Exception:
+            pass
+        
+        return None
     
     def fetch_cover_art(self, artist: str, album: str) -> Optional[bytes]:
-        """Fetch cover art from iTunes API"""
+        """Fetch cover art from multiple sources with fallback"""
         if not artist or not album:
             return None
-            
+        
+        # Try multiple sources in order of preference
+        sources = [
+            self._fetch_cover_itunes,
+            self._fetch_cover_lastfm,
+            self._fetch_cover_spotify,
+            self._fetch_cover_deezer
+        ]
+        
+        for source_func in sources:
+            try:
+                cover_data = source_func(artist, album)
+                if cover_data and len(cover_data) > 1000:  # Ensure meaningful image data
+                    return cover_data
+            except Exception as e:
+                console.print(f"[dim]Cover source failed: {e}[/dim]")
+                continue
+        
+        return None
+    
+    def _fetch_cover_itunes(self, artist: str, album: str) -> Optional[bytes]:
+        """Fetch cover art from iTunes API"""
         try:
-            artist = self._clean_string(artist)
-            album = self._clean_string(album)
-            
-            # iTunes Search API
             search_term = f"{artist} {album}".replace(" ", "+")
-            api_url = f"https://itunes.apple.com/search?term={search_term}&entity=album&limit=1"
+            api_url = f"https://itunes.apple.com/search?term={search_term}&entity=album&limit=5"
             
             response = self.session.get(api_url, timeout=self.timeout)
             if response.status_code != 200:
@@ -396,23 +528,112 @@ class MetadataEnhancer:
             data = response.json()
             results = data.get("results", [])
             
-            if results:
-                # Get high-resolution artwork
-                artwork_url = results[0].get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+            for result in results:
+                # Try highest resolution first
+                artwork_url = result.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
                 if artwork_url:
                     img_response = self.session.get(artwork_url, timeout=self.timeout)
-                    if img_response.status_code == 200:
+                    if img_response.status_code == 200 and len(img_response.content) > 1000:
                         return img_response.content
             
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Cover art fetch failed: {e}")
-            return None
+        except Exception:
+            pass
+        
+        return None
     
-    def _clean_string(self, s: str) -> str:
-        """Clean string for API queries"""
-        return s.strip().replace("&", "and").replace("/", " ")
+    def _fetch_cover_lastfm(self, artist: str, album: str) -> Optional[bytes]:
+        """Fetch cover art from Last.fm API (no key required for album info)"""
+        try:
+            # Last.fm album info API
+            api_url = "http://ws.audioscrobbler.com/2.0/"
+            params = {
+                "method": "album.getinfo",
+                "artist": artist,
+                "album": album,
+                "format": "json"
+            }
+            
+            response = self.session.get(api_url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            album_info = data.get("album", {})
+            images = album_info.get("image", [])
+            
+            # Find largest image
+            for img in reversed(images):  # Start from largest
+                img_url = img.get("#text")
+                if img_url:
+                    img_response = self.session.get(img_url, timeout=self.timeout)
+                    if img_response.status_code == 200 and len(img_response.content) > 1000:
+                        return img_response.content
+            
+        except Exception:
+            pass
+        
+        return None
+    
+    def _fetch_cover_spotify(self, artist: str, album: str) -> Optional[bytes]:
+        """Fetch cover art from Spotify Web API (public endpoints)"""
+        try:
+            # Spotify search endpoint (no auth needed for basic search)
+            search_url = "https://api.spotify.com/v1/search"
+            params = {
+                "q": f"artist:{artist} album:{album}",
+                "type": "album",
+                "limit": 5
+            }
+            
+            response = self.session.get(search_url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            albums = data.get("albums", {}).get("items", [])
+            
+            for album_data in albums:
+                images = album_data.get("images", [])
+                if images:
+                    # Get highest resolution image
+                    img_url = images[0].get("url")
+                    if img_url:
+                        img_response = self.session.get(img_url, timeout=self.timeout)
+                        if img_response.status_code == 200 and len(img_response.content) > 1000:
+                            return img_response.content
+            
+        except Exception:
+            pass
+        
+        return None
+    
+    def _fetch_cover_deezer(self, artist: str, album: str) -> Optional[bytes]:
+        """Fetch cover art from Deezer API"""
+        try:
+            # Deezer search API
+            search_url = "https://api.deezer.com/search/album"
+            params = {"q": f"{artist} {album}", "limit": 5}
+            
+            response = self.session.get(search_url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            albums = data.get("data", [])
+            
+            for album_data in albums:
+                # Try different resolutions
+                for size in ["cover_xl", "cover_big", "cover_medium"]:
+                    img_url = album_data.get(size)
+                    if img_url:
+                        img_response = self.session.get(img_url, timeout=self.timeout)
+                        if img_response.status_code == 200 and len(img_response.content) > 1000:
+                            return img_response.content
+            
+        except Exception:
+            pass
+        
+        return None
 
 # -----------------------------------------------------------------------------
 # SECTION 6: Progress Management & UI
@@ -453,54 +674,76 @@ class MusicOrganizer:
     
     def __init__(self, config: Config):
         self.config = config
+        self.output_dir = Path(config.output_folder)
         self.network_monitor = NetworkMonitor(config.ping_interval)
         self.duplicate_manager = DuplicateManager()
         self.metadata_enhancer = MetadataEnhancer(config.request_timeout, config.max_retries)
         self.progress_manager = ProgressManager(self.network_monitor)
         self.stats = FileStats()
         
-        # Organization patterns for different folder structures
-        self.patterns = {
-            'artist_album': '{artist}/{album}/{track:02d} - {title}.{ext}',
-            'genre_artist': '{genre}/{artist}/{title}.{ext}',
-            'year_artist': '{year}/{artist} - {album}/{title}.{ext}',
-            'flat_artist': '{artist} - {title} [{album}].{ext}',
-            'artist_only': '{artist}/{title}.{ext}'
-        }
+        # Create output directory and setup logging/reporting there
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Setup logging to output folder
+        self.log_file = self.output_dir / 'organizer.log'
+        self.report_csv = self.output_dir / 'report.csv'
+        self.setup_logging()
         
         # Setup CSV reporting
         self.setup_reporting()
     
+    def setup_logging(self):
+        """Setup logging to output folder"""
+        # Remove existing handlers
+        logger = logging.getLogger("music_organizer")
+        logger.handlers.clear()
+        
+        # Add new handlers
+        logger.addHandler(RichHandler(rich_tracebacks=True))
+        logger.addHandler(logging.FileHandler(self.log_file, encoding="utf-8"))
+        logger.setLevel(logging.INFO)
+    
     def setup_reporting(self):
-        """Initialize CSV reporting for processed files"""
-        self.csv_file = open(REPORT_CSV, 'w', newline='', encoding='utf-8')
+        """Initialize CSV reporting for processed files in output folder"""
+        self.csv_file = open(self.report_csv, 'w', newline='', encoding='utf-8')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
-            'Original Path', 'New Path', 'Artist', 'Title', 'Album', 
-            'Action', 'Timestamp', 'File Size (MB)'
+            'Original Path', 'New Path', 'Artist', 'Title', 'Album', 'Genre', 'Year',
+            'Action', 'Timestamp', 'File Size (MB)', 'Lyrics Found', 'Cover Found'
         ])
     
     def start(self):
         """Start the complete organization process"""
+        logger = logging.getLogger("music_organizer")
         try:
             self.network_monitor.start_monitoring()
             self._run_organization()
         finally:
             self.network_monitor.stop_monitoring()
-            self.stats.save()
+            self.stats.save(self.output_dir)
             if hasattr(self, 'csv_file'):
                 self.csv_file.close()
+            logger.info("Organization process completed")
     
     def _run_organization(self):
         """Main organization workflow with all features"""
+        logger = logging.getLogger("music_organizer")
+        
+        # Display configuration panel
+        organization_mode = "Artist folders" if self.config.organize_by_artist else "Flat (all in output folder)"
+        
         console.print(Panel.fit(
-            "[bold green]🎵 Enhanced Music Organizer v2.0[/bold green]\n"
+            "[bold green]🎵 Enhanced Music Organizer v2.1[/bold green]\n"
             f"[cyan]Root:[/cyan] {self.config.root_folder}\n"
             f"[cyan]Output:[/cyan] {self.config.output_folder}\n"
             f"[cyan]Mode:[/cyan] {self.config.mode.upper()}\n"
-            f"[cyan]Pattern:[/cyan] {self.config.pattern}",
+            f"[cyan]Organization:[/cyan] {organization_mode}\n"
+            f"[cyan]Fetch Lyrics:[/cyan] {'Yes' if self.config.fetch_lyrics else 'No'}\n"
+            f"[cyan]Fetch Covers:[/cyan] {'Yes' if self.config.fetch_covers else 'No'}",
             title="Configuration"
         ))
+        
+        logger.info(f"Starting organization: {self.config.root_folder} -> {self.config.output_folder}")
         
         # Step 1: Scan for music files
         console.print("\n[yellow]📁 Scanning for music files...[/yellow]")
@@ -508,9 +751,11 @@ class MusicOrganizer:
         
         if not music_files:
             console.print("[red]❌ No music files found![/red]")
+            logger.warning("No music files found in root folder")
             return
         
         console.print(f"[green]✅ Found {len(music_files)} music files[/green]")
+        logger.info(f"Found {len(music_files)} music files")
         
         # Step 2: Handle duplicates
         if len(music_files) > 1:
@@ -535,6 +780,7 @@ class MusicOrganizer:
     
     def _handle_duplicates(self, music_files: List[Path]):
         """Advanced duplicate detection and handling"""
+        logger = logging.getLogger("music_organizer")
         console.print("\n[yellow]🔍 Checking for duplicates...[/yellow]")
         
         duplicates = self.duplicate_manager.find_duplicates(
@@ -543,9 +789,11 @@ class MusicOrganizer:
         
         if not duplicates:
             console.print("[green]✅ No duplicates found[/green]")
+            logger.info("No duplicates found")
             return
         
         console.print(f"[red]⚠️  Found {len(duplicates)} groups of duplicates[/red]")
+        logger.warning(f"Found {len(duplicates)} groups of duplicates")
         
         for i, (hash_val, files) in enumerate(duplicates.items(), 1):
             console.print(f"\n[bold]Duplicate Group {i}:[/bold]")
@@ -571,9 +819,7 @@ class MusicOrganizer:
             console.print(table)
             
             # Handle duplicate deletion
-            if self.config.auto_delete_duplicates or Confirm.ask(
-                "Delete duplicates? (keeps the first file)"
-            ):
+            if Confirm.ask("Delete duplicates? (keeps the first file)"):
                 # Keep the first file, delete others
                 for file_to_delete in files[1:]:
                     try:
@@ -581,15 +827,15 @@ class MusicOrganizer:
                         music_files.remove(file_to_delete)
                         self.stats.duplicates += 1
                         console.print(f"[red]🗑️  Deleted: {file_to_delete.name}[/red]")
+                        logger.info(f"Deleted duplicate: {file_to_delete}")
                     except Exception as e:
                         console.print(f"[red]❌ Failed to delete {file_to_delete}: {e}[/red]")
+                        logger.error(f"Failed to delete duplicate {file_to_delete}: {e}")
     
     def _process_files(self, music_files: List[Path]):
         """Process all music files with rich progress tracking"""
+        logger = logging.getLogger("music_organizer")
         console.print(f"\n[yellow]🎵 Processing {len(music_files)} files...[/yellow]")
-        
-        output_dir = Path(self.config.output_folder)
-        output_dir.mkdir(parents=True, exist_ok=True)
         
         with self.progress_manager.create_progress() as progress:
             task = progress.add_task(
@@ -611,7 +857,7 @@ class MusicOrganizer:
                         duplicates=self.stats.duplicates
                     )
                     
-                    self._process_single_file(file_path, output_dir, progress, task)
+                    self._process_single_file(file_path, progress, task)
                     
                 except Exception as e:
                     logger.error(f"Error processing {file_path}: {e}")
@@ -620,8 +866,10 @@ class MusicOrganizer:
                 progress.advance(task)
                 time.sleep(0.1)  # Brief pause for UI responsiveness
     
-    def _process_single_file(self, file_path: Path, output_dir: Path, progress, task):
+    def _process_single_file(self, file_path: Path, progress, task):
         """Process individual music file with metadata enhancement"""
+        logger = logging.getLogger("music_organizer")
+        
         try:
             # Load and parse metadata
             audio_file = mutagen.File(file_path)
@@ -632,12 +880,16 @@ class MusicOrganizer:
             
             metadata = self._extract_metadata(audio_file, file_path)
             
-            # Enhance metadata with online services if connected
-            if self.network_monitor.is_connected:
-                self._enhance_metadata(metadata, audio_file)
+            # Enhance metadata with online services if connected and enabled
+            lyrics_found = False
+            cover_found = False
             
-            # Generate organized output path
-            output_path = self._generate_output_path(metadata, output_dir, file_path.suffix)
+            if self.network_monitor.is_connected:
+                if self.config.fetch_lyrics or self.config.fetch_covers:
+                    lyrics_found, cover_found = self._enhance_metadata(metadata, audio_file)
+            
+            # Generate organized output path with new naming convention
+            output_path = self._generate_output_path(metadata, file_path.suffix)
             
             # Ensure parent directory exists
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -657,26 +909,34 @@ class MusicOrganizer:
             self.stats.total_size += file_size
             self.stats.processed += 1
             
-            # Log to CSV report
+            if lyrics_found:
+                self.stats.lyrics_found += 1
+            if cover_found:
+                self.stats.covers_found += 1
+            
+            # Log to CSV report with enhanced metadata
             self.csv_writer.writerow([
                 str(file_path), str(output_path), metadata['artist'], 
-                metadata['title'], metadata['album'], action, 
-                time.strftime('%Y-%m-%d %H:%M:%S'), f"{file_size / (1024*1024):.2f}"
+                metadata['title'], metadata['album'], metadata['genre'], metadata['year'],
+                action, time.strftime('%Y-%m-%d %H:%M:%S'), f"{file_size / (1024*1024):.2f}",
+                "Yes" if lyrics_found else "No", "Yes" if cover_found else "No"
             ])
+            
+            logger.info(f"Processed: {file_path.name} -> {output_path.name}")
             
         except Exception as e:
             logger.error(f"Failed to process {file_path}: {e}")
             self.stats.errors += 1
     
     def _extract_metadata(self, audio_file, file_path: Path) -> Dict[str, Any]:
-        """Extract comprehensive metadata from audio file"""
+        """Extract comprehensive metadata from audio file with improved parsing"""
         metadata = {
             'artist': 'Unknown Artist',
             'album': 'Unknown Album',
             'title': file_path.stem,
             'track': 1,
-            'year': '',
-            'genre': '',
+            'year': 'Unknown',
+            'genre': 'Unknown',
             'ext': file_path.suffix[1:].lower()
         }
         
@@ -701,6 +961,14 @@ class MusicOrganizer:
                         metadata['track'] = int(str(track_tag).split('/')[0])
                     except (ValueError, IndexError):
                         pass
+                
+                # Clean up year - extract just the year part if it's a date
+                if metadata['year'] and metadata['year'] != 'Unknown':
+                    year_match = re.search(r'\d{4}', str(metadata['year']))
+                    if year_match:
+                        metadata['year'] = year_match.group()
+                    else:
+                        metadata['year'] = 'Unknown'
         
         # Clean metadata for filesystem compatibility
         for key, value in metadata.items():
@@ -719,8 +987,11 @@ class MusicOrganizer:
                 return str(value) if value else None
         return None
     
-    def _enhance_metadata(self, metadata: Dict[str, Any], audio_file):
-        """Enhance metadata using online services"""
+    def _enhance_metadata(self, metadata: Dict[str, Any], audio_file) -> Tuple[bool, bool]:
+        """Enhance metadata using multiple online services"""
+        lyrics_found = False
+        cover_found = False
+        
         try:
             # Fetch lyrics if enabled
             if self.config.fetch_lyrics:
@@ -728,32 +999,45 @@ class MusicOrganizer:
                     metadata['artist'], metadata['title']
                 )
                 if lyrics:
-                    self.stats.lyrics_found += 1
+                    lyrics_found = True
+                    console.print(f"[dim green]📝 Found lyrics for: {metadata['artist']} - {metadata['title']}[/dim green]")
                     # In production, you'd embed lyrics into the file
             
             # Fetch cover art if enabled
-            if self.config.fetch_covers:
+            if self.config.fetch_covers and metadata['album'] != 'Unknown Album':
                 cover_art = self.metadata_enhancer.fetch_cover_art(
                     metadata['artist'], metadata['album']
                 )
                 if cover_art:
-                    self.stats.covers_found += 1
+                    cover_found = True
+                    console.print(f"[dim green]🖼️  Found cover for: {metadata['artist']} - {metadata['album']}[/dim green]")
                     # In production, you'd embed cover art into the file
                     
         except Exception as e:
-            logger.debug(f"Metadata enhancement failed: {e}")
+            console.print(f"[dim red]Metadata enhancement failed: {e}[/dim red]")
+        
+        return lyrics_found, cover_found
     
-    def _generate_output_path(self, metadata: Dict[str, Any], output_dir: Path, extension: str) -> Path:
-        """Generate organized output path based on selected pattern"""
-        pattern = self.patterns.get(self.config.pattern, self.patterns['artist_album'])
+    def _generate_output_path(self, metadata: Dict[str, Any], extension: str) -> Path:
+        """Generate organized output path with new naming convention"""
+        # Clean filename components
+        artist = metadata['artist']
+        title = metadata['title'] 
+        album = metadata['album']
         
-        try:
-            filename = pattern.format(**metadata)
-        except KeyError as e:
-            logger.warning(f"Missing metadata key {e}, using fallback pattern")
-            filename = self.patterns['artist_only'].format(**metadata)
+        # Create filename: "Artist - Title [Album]" or "Artist - Title"
+        if album and album != 'Unknown Album':
+            filename = f"{artist} - {title} [{album}]{extension}"
+        else:
+            filename = f"{artist} - {title}{extension}"
         
-        return output_dir / filename
+        # Determine output path based on organization setting
+        if self.config.organize_by_artist:
+            # Organize into artist folders
+            return self.output_dir / artist / filename
+        else:
+            # Flat organization (all files in output folder)
+            return self.output_dir / filename
     
     def _resolve_file_conflict(self, path: Path) -> Path:
         """Resolve naming conflicts by adding numbers or timestamps"""
@@ -791,6 +1075,8 @@ class MusicOrganizer:
     
     def _show_final_stats(self):
         """Display comprehensive processing statistics"""
+        logger = logging.getLogger("music_organizer")
+        
         # Create detailed statistics table
         table = Table(title="🎵 Processing Results")
         table.add_column("Metric", style="cyan")
@@ -811,11 +1097,13 @@ class MusicOrganizer:
         
         # Show warnings if there were errors
         if self.stats.errors > 0:
-            console.print(f"\n[yellow]⚠️  {self.stats.errors} files had errors. Check {LOG_FILE} for details.[/yellow]")
+            console.print(f"\n[yellow]⚠️  {self.stats.errors} files had errors. Check {self.log_file} for details.[/yellow]")
         
         console.print(f"\n[bold green]✅ Organization complete![/bold green]")
-        console.print(f"[dim]📊 Report saved to: {REPORT_CSV}[/dim]")
-        console.print(f"[dim]📋 Log saved to: {LOG_FILE}[/dim]")
+        console.print(f"[dim]📊 Report saved to: {self.report_csv}[/dim]")
+        console.print(f"[dim]📋 Log saved to: {self.log_file}[/dim]")
+        
+        logger.info(f"Final stats: {self.stats.processed} processed, {self.stats.errors} errors, {self.stats.lyrics_found} lyrics, {self.stats.covers_found} covers")
 
 # -----------------------------------------------------------------------------
 # SECTION 8: Command Line Interface
@@ -825,17 +1113,16 @@ class MusicOrganizer:
 @click.option('--root', '-r', type=click.Path(exists=True), help='Root music folder')
 @click.option('--output', '-o', type=click.Path(), help='Output folder')
 @click.option('--mode', type=click.Choice(['copy', 'move']), help='Operation mode')
-@click.option('--pattern', type=click.Choice(['artist_album', 'genre_artist', 'year_artist', 'flat_artist', 'artist_only']), help='Organization pattern')
+@click.option('--organize-by-artist', is_flag=True, help='Organize into artist folders')
 @click.option('--workers', type=int, help='Number of parallel workers')
-@click.option('--auto-delete-duplicates', is_flag=True, help='Automatically delete duplicates')
 @click.option('--no-lyrics', is_flag=True, help='Skip lyrics fetching')
 @click.option('--no-covers', is_flag=True, help='Skip cover art fetching')
 @click.option('--config', is_flag=True, help='Show current configuration')
-def main(root, output, mode, pattern, workers, auto_delete_duplicates, no_lyrics, no_covers, config):
-    """Enhanced Music File Organizer v2.0
+def main(root, output, mode, organize_by_artist, workers, no_lyrics, no_covers, config):
+    """Enhanced Music File Organizer v2.1
     
     A comprehensive tool for organizing your music collection with advanced features
-    including duplicate detection, metadata enhancement, and parallel processing.
+    including duplicate detection, metadata enhancement, and flexible organization.
     """
     
     # Load existing configuration
@@ -848,12 +1135,10 @@ def main(root, output, mode, pattern, workers, auto_delete_duplicates, no_lyrics
         app_config.output_folder = output
     if mode:
         app_config.mode = mode
-    if pattern:
-        app_config.pattern = pattern
+    if organize_by_artist:
+        app_config.organize_by_artist = True
     if workers:
         app_config.max_workers = workers
-    if auto_delete_duplicates:
-        app_config.auto_delete_duplicates = True
     if no_lyrics:
         app_config.fetch_lyrics = False
     if no_covers:
@@ -861,13 +1146,13 @@ def main(root, output, mode, pattern, workers, auto_delete_duplicates, no_lyrics
     
     # Show configuration if requested
     if config:
+        organization_mode = "Artist folders" if app_config.organize_by_artist else "Flat (all in output folder)"
         console.print(Panel(
             f"[cyan]Root Folder:[/cyan] {app_config.root_folder}\n"
             f"[cyan]Output Folder:[/cyan] {app_config.output_folder}\n"
             f"[cyan]Mode:[/cyan] {app_config.mode}\n"
-            f"[cyan]Pattern:[/cyan] {app_config.pattern}\n"
+            f"[cyan]Organization:[/cyan] {organization_mode}\n"
             f"[cyan]Workers:[/cyan] {app_config.max_workers}\n"
-            f"[cyan]Auto Delete Duplicates:[/cyan] {app_config.auto_delete_duplicates}\n"
             f"[cyan]Fetch Lyrics:[/cyan] {app_config.fetch_lyrics}\n"
             f"[cyan]Fetch Covers:[/cyan] {app_config.fetch_covers}",
             title="Current Configuration"
@@ -881,20 +1166,41 @@ def main(root, output, mode, pattern, workers, auto_delete_duplicates, no_lyrics
             default=str(Path.cwd())
         )
     
-    # Default output to root/output as requested
-    if not app_config.output_folder:
+    # Interactive prompt for output folder with default
+    if not app_config.output_folder and not output:
         default_output = Path(app_config.root_folder) / "output"
         app_config.output_folder = Prompt.ask(
-            "Enter output folder", 
+            "Where would you like to save organized files?",
             default=str(default_output)
         )
     
-    # Interactive mode selection as requested
-    if not mode:  # Only ask if not provided via CLI
+    # Interactive mode selection (only if not provided via CLI)
+    if not mode:
         app_config.mode = Prompt.ask(
             "Keep originals (copy) or cut (move)?",
             choices=["copy", "move"],
             default="copy"
+        )
+    
+    # Interactive organization preference (only if not provided via CLI)
+    if not organize_by_artist:
+        app_config.organize_by_artist = Confirm.ask(
+            "Organize files into artist folders?",
+            default=False
+        )
+    
+    # Interactive lyrics fetching preference (only if not disabled via CLI)
+    if not no_lyrics:
+        app_config.fetch_lyrics = Confirm.ask(
+            "Fetch lyrics from online sources?",
+            default=True
+        )
+    
+    # Interactive cover art fetching preference (only if not disabled via CLI)
+    if not no_covers:
+        app_config.fetch_covers = Confirm.ask(
+            "Fetch cover art from online sources?",
+            default=True
         )
     
     # Validate that root folder exists
@@ -914,6 +1220,7 @@ def main(root, output, mode, pattern, workers, auto_delete_duplicates, no_lyrics
         console.print("\n[yellow]⚠️  Process interrupted by user[/yellow]")
     except Exception as e:
         console.print(f"\n[red]❌ Fatal error: {e}[/red]")
+        logger = logging.getLogger("music_organizer")
         logger.exception("Fatal error occurred")
 
 # -----------------------------------------------------------------------------
