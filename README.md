@@ -102,14 +102,22 @@ After initial processing, the script offers:
 
 ## 📁 Output Structure
 
+The output directory can be organized in different structures depending on the configuration used. Below are the supported organization formats:
+
 ### Standard Organization
+Files are placed directly in the `Output/` directory with a consistent naming convention: `Artist - Song [Album].extension`.
+
+```
 Output/
 ├── Artist1 - Song1 [Album1].mp3
 ├── Artist2 - Song2.mp3
 └── Artist3 - Song3 [Album2].flac
-
+```
 
 ### Artist Folders
+Files are grouped into subdirectories named after the artist, with the same naming convention for files.
+
+```
 Output/
 ├── Artist1/
 │   ├── Artist1 - Song1 [Album1].mp3
@@ -118,21 +126,26 @@ Output/
 │   └── Artist2 - Song3.flac
 └── Artist3/
     └── Artist3 - Song4 [Album2].m4a
-
+```
 
 ### Language + Artist Organization
+Files are organized first by language, then by artist, with files following the same naming convention.
+
+```
 Output/
 ├── Persian/
 │   ├── Artist1/
 │   │   ├── Artist1 - Song1 [Album1].mp3
 │   │   └── Artist1 - Song2.mp3
-│   └── Artist2 - Song3.mp3
+│   └── Artist2/
+│       └── Artist2 - Song3.mp3
 ├── English/
 │   └── Artist3/
 │       └── Artist3 - Song4 [Album2].flac
 └── Arabic/
-    └── Artist4 - Song5.ogg
-
+    └── Artist4/
+        └── Artist4 - Song5.ogg
+```
 
 ## 📊 Reports & Logging
 
