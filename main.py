@@ -123,6 +123,7 @@ from send2trash import send2trash
 import asyncio
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
+
 # -----------------------------------------------------------------------------
 # SECTION 2: Configuration & Data Classes
 # -----------------------------------------------------------------------------
@@ -369,16 +370,20 @@ class MetadataEnhancer:
     
     def fetch_lyrics(self, artist: str, title: str) -> Optional[str]:
         """Fetch lyrics from multiple sources with fallback"""
-        if not artist or not title:
-            return None
-        
         # Try multiple sources in order of preference
         sources = [
             self._fetch_lyrics_azlyrics,
             self._fetch_lyrics_genius,
-            self._fetch_lyrics_lyricscom
+            self._fetch_lyrics_lyricscom,
+            self._fetch_lyrics_musixmatch,
+            self._fetch_lyrics_chartlyrics,
+            self._fetch_lyrics_vagalume,
+            self._fetch_lyrics_lyricwiki,
+            self._fetch_lyrics_ovh,         
+            self._fetch_lyrics_lyricsfa,
+            self._fetch_lyrics_songlyrics,     
+            self._fetch_lyrics_lyricfreak,
         ]
-        
         for source_func in sources:
             try:
                 lyrics = source_func(artist, title)
@@ -388,6 +393,76 @@ class MetadataEnhancer:
                 continue
         
         return None
+    
+    def _fetch_lyrics_songlyrics(self, artist: str, title: str) -> Optional[str]:
+        """Scrape songlyrics.com"""
+        q = quote_plus(f"{artist} {title}")
+        search_url = f"https://www.songlyrics.com/index.php?section=search&searchW={q}&submit=Search"
+        r = self.session.get(search_url, timeout=self.timeout)
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        # first result link under table.search-result
+        link = soup.select_one("td.tal.qx a")
+        if not link or not link["href"]:
+            return None
+        page = self.session.get(link["href"], timeout=self.timeout)
+        if page.status_code != 200:
+            return None
+        ps = BeautifulSoup(page.text, "html.parser")
+        lyrics_div = ps.find("p", id="songLyricsDiv")
+        return lyrics_div.get_text("").strip() if lyrics_div else None
+
+    def _fetch_lyrics_lyricfreak(self, artist: str, title: str) -> Optional[str]:
+        """Scrape lyricfreak.com"""
+        q = quote_plus(f"{artist} {title}")
+        search_url = f"https://www.lyricfreak.com/search.php?a=search&type=song&q={q}"
+        r = self.session.get(search_url, timeout=self.timeout)
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        link = soup.select_one("a.song")
+        if not link or not link["href"]:
+            return None
+        page = self.session.get(link["href"], timeout=self.timeout)
+        if page.status_code != 200:
+            return None
+        ps = BeautifulSoup(page.text, "html.parser")
+        ly = ps.find("div", class_="lyrics")
+        return ly.get_text("").strip() if ly else None
+    
+    def _fetch_lyrics_ovh(self, artist: str, title: str) -> Optional[str]:
+        """Free lyrics API: https://api.lyrics.ovh"""
+        url = f"https://api.lyrics.ovh/v1/{quote_plus(artist)}/{quote_plus(title)}"
+        resp = self.session.get(url, timeout=self.timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data.get("lyrics")
+
+    def _fetch_lyrics_lyricsfa(self, artist: str, title: str) -> Optional[str]:
+        """
+        Scrape lyricsfa.ir (a popular Persian lyrics site),
+        by searching artist+title and picking the first result.
+        """
+        query = quote_plus(f"{artist} {title}")
+        search_url = f"https://lyricsfa.ir/search/?q={query}"
+        resp = self.session.get(search_url, timeout=self.timeout)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # find first result link (you may need to tweak selectors if site layout changes)
+        link = soup.select_one("h3.entry-title a")
+        if not link or not link["href"]:
+            return None
+
+        page = self.session.get(link["href"], timeout=self.timeout)
+        if page.status_code != 200:
+            return None
+        page_soup = BeautifulSoup(page.text, "html.parser")
+        box = page_soup.select_one("div.lyricsBox") or page_soup.select_one("div.entry-content")
+        return box.get_text(separator="\n").strip() if box else None
     
     def _fetch_lyrics_azlyrics(self, artist: str, title: str) -> Optional[str]:
         """Fetch lyrics from AZLyrics (web scraping)"""
@@ -509,28 +584,256 @@ class MetadataEnhancer:
         
         return None
     
+    def _fetch_lyrics_chartlyrics(self, artist: str, title: str) -> Optional[str]:
+        """ChartLyrics SOAP API"""
+        url = "http://api.chartlyrics.com/apiv1.asmx/SearchLyricDirect"
+        params = {"artist": artist, "song": title}
+        resp = self.session.get(url, params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            return None
+        # XML parsing
+        import xml.etree.ElementTree as ET
+        tree = ET.fromstring(resp.text)
+        lyric = tree.findtext('.//Lyric')
+        return lyric.strip() if lyric else None
+
+    def _fetch_lyrics_vagalume(self, artist: str, title: str) -> Optional[str]:
+        """Vagalume free API"""
+        url = "https://api.vagalume.com.br/search.php"
+        params = {"art": artist, "mus": title}
+        resp = self.session.get(url, params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            return None
+        js = resp.json()
+        # try to grab first lyrics
+        matches = js.get("mus", [])
+        if matches:
+            text = matches[0].get("text", "")
+            return text.replace("","").strip()
+        return None
+
+    def _fetch_lyrics_lyricwiki(self, artist: str, title: str) -> Optional[str]:
+        """LyricWiki via Fandom’s API"""
+        # slugify artist/title
+        slug = f"{artist.strip().replace(' ', '_')}_{title.strip().replace(' ', '_')}"
+        url = f"https://lyrics.fandom.com/api.php"
+        params = {
+            "action": "parse",
+            "page": slug,
+            "format": "json",
+            "prop": "wikitext",
+        }
+        resp = self.session.get(url, params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        wikitext = data.get("parse", {}).get("wikitext", {}).get("*", "")
+        # strip out wiki markup as best we can
+        import re
+        lyrics = re.sub(r"\{\{.*?\}\}", "", wikitext, flags=re.S)
+        lyrics = re.sub(r"\[https?://[^\]]+\]", "", lyrics)
+        return lyrics.strip() if len(lyrics) > 50 else None
+    
+    def _fetch_lyrics_musixmatch(self, artist: str, title: str) -> Optional[str]:
+        """Fetch lyrics via the Musixmatch API."""
+        api_key = os.getenv("MUSIXMATCH_KEY")
+        if not api_key:
+            return None
+        url = "https://api.musixmatch.com/ws/1.1/matcher.lyrics.get"
+        params = {
+            "q_artist": artist,
+            "q_track": title,
+            "apikey": api_key,
+        }
+        resp = self.session.get(url, params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("message", {}).get("body", {}).get("lyrics", {})
+        text = data.get("lyrics_body", "")
+        return text.split("*******")[0].strip() if text else None
+    
+    
     def fetch_cover_art(self, artist: str, album: str) -> Optional[bytes]:
         """Fetch cover art from multiple sources with fallback"""
-        if not artist or not album:
-            return None
         
         # Try multiple sources in order of preference
         sources = [
+            self._fetch_cover_local,               
             self._fetch_cover_itunes,
             self._fetch_cover_lastfm,
             self._fetch_cover_coverartarchive,
-            self._fetch_cover_deezer
+            self._fetch_cover_deezer,
+            self._fetch_cover_spotify,
+            self._fetch_cover_discogs,             
+            self._fetch_cover_google_images,
+            self._fetch_cover_bing,         
+            self._fetch_cover_soundcloud,
+            self._fetch_cover_saavn,          
+            self._fetch_cover_zingmp3,         
+            self._fetch_cover_yandex,          
         ]
-        
-        for source_func in sources:
+        for fn in sources:
             try:
-                cover_data = source_func(artist, album)
-                if cover_data and len(cover_data) > 1000:  # Ensure meaningful image data
-                    return cover_data
+                img = fn(artist, album)
+                if img and len(img) > 1_000:
+                    return img
             except Exception:
                 continue
-        
         return None
+    
+    def _fetch_cover_saavn(self, artist: str, album: str) -> Optional[bytes]:
+        """Use the public Saavn autocomplete API."""
+        q = f"{artist} {album}"
+        params = {
+            "__call": "autocomplete.get",
+            "query": q,
+            "_format": "json",
+            "_marker": "0"
+        }
+        r = self.session.get("https://www.saavn.com/api.php", params=params, timeout=self.timeout)
+        if r.status_code != 200:
+            return None
+        albums = r.json().get("albums", [])
+        if not albums:
+            return None
+        art = albums[0].get("more_info", {}).get("album_art")
+        if not art:
+            return None
+        img = self.session.get(art, timeout=self.timeout)
+        if img.status_code == 200:
+            return img.content
+
+    def _fetch_cover_zingmp3(self, artist: str, album: str) -> Optional[bytes]:
+        """Unofficial ZingMP3 search API (Vietnamese service)."""
+        q = quote_plus(f"{artist} {album}")
+        url = f"https://zingmp3.vn/search/album?query={q}"
+        r = self.session.get(url, timeout=self.timeout)
+        if r.status_code != 200:
+            return None
+        data = r.json().get("data", {}).get("albums", [])
+        if not data:
+            return None
+        cover = data[0].get("cover")
+        if not cover:
+            return None
+        img = self.session.get(cover, timeout=self.timeout)
+        if img.status_code == 200:
+            return img.content
+
+    def _fetch_cover_yandex(self, artist: str, album: str) -> Optional[bytes]:
+        """Scrape Yandex Images first thumbnail."""
+        q = quote_plus(f"{artist} {album} album cover art")
+        url = f"https://yandex.com/images/search?text={q}"
+        r = self.session.get(url, timeout=self.timeout)
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        img_tag = soup.select_one("img.serp-item__thumb")
+        src = img_tag.get("src") or img_tag.get("data-src")
+        if not src:
+            return None
+        # Yandex often returns a small base64 or lazy URL, skip if so
+        if src.startswith("data:"):
+            return None
+        img = self.session.get(src, timeout=self.timeout)
+        if img.status_code == 200:
+            return img.content
+    
+    def _fetch_cover_spotify(self, artist: str, album: str) -> Optional[bytes]:
+        """Fetch cover via the Spotify Web API."""
+        client_id     = os.getenv("SPOTIFY_CLIENT_ID")
+        client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            return None
+        # get token
+        token_resp = requests.post(
+            "https://accounts.spotify.com/api/token",
+            data={"grant_type": "client_credentials"},
+            auth=(client_id, client_secret),
+            timeout=self.timeout
+        )
+        if token_resp.status_code != 200:
+            return None
+        token = token_resp.json().get("access_token")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # search for album
+        q = f"album:{album} artist:{artist}"
+        resp = self.session.get(
+            "https://api.spotify.com/v1/search",
+            headers=headers,
+            params={"q": q, "type": "album", "limit": 1},
+            timeout=self.timeout
+        )
+        if resp.status_code != 200:
+            return None
+        items = resp.json().get("albums", {}).get("items", [])
+        if not items:
+            return None
+
+        # pull the largest image
+        img_url = items[0].get("images", [])[-1].get("url")
+        if not img_url:
+            return None
+        img_resp = self.session.get(img_url, timeout=self.timeout)
+        return img_resp.content if img_resp.status_code == 200 else None
+    
+    def _fetch_cover_local(self, artist: str, album: str) -> Optional[bytes]:
+        """Look for common artwork files next to your music."""
+        import glob
+        folder = Path(self.output_dir)  # or wherever you're processing
+        patterns = ["cover.jpg", "folder.jpg", "front.*", "*.png"]
+        for p in patterns:
+            matches = list(folder.rglob(p))
+            if matches:
+                return matches[0].read_bytes()
+        return None
+
+    def _fetch_cover_discogs(self, artist: str, album: str) -> Optional[bytes]:
+        """Fetch cover via Discogs API (requires DISCOGS_TOKEN env var)."""
+        token = os.getenv("DISCOGS_TOKEN")
+        if not token:
+            return None
+        headers = {"Authorization": f"Discogs token={token}"}
+        q = f"{artist} {album}"
+        resp = self.session.get(
+            "https://api.discogs.com/database/search",
+            headers=headers,
+            params={"q": q, "type": "release", "per_page": 1},
+            timeout=self.timeout
+        )
+        if resp.status_code != 200:
+            return None
+        results = resp.json().get("results", [])
+        if not results:
+            return None
+        thumb = results[0].get("thumb")
+        # try primary URLs first
+        img_url = results[0].get("cover_image", thumb)
+        if not img_url:
+            return None
+        img_resp = self.session.get(img_url, timeout=self.timeout)
+        return img_resp.content if img_resp.status_code == 200 else None
+
+    def _fetch_cover_google_images(self, artist: str, album: str) -> Optional[bytes]:
+        """Scrape Google Images via SerpAPI (requires SERPAPI_KEY)."""
+        key = os.getenv("SERPAPI_KEY")
+        if not key:
+            return None
+        from urllib.parse import quote_plus
+        query = quote_plus(f"{artist} {album} album cover art")
+        url = f"https://serpapi.com/search.json?engine=google_images&q={query}&api_key={key}&ijn=0"
+        resp = self.session.get(url, timeout=self.timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("images_results", [])
+        if not data:
+            return None
+        img_url = data[0].get("original")
+        if not img_url:
+            return None
+        img_resp = self.session.get(img_url, timeout=self.timeout)
+        return img_resp.content if img_resp.status_code == 200 else None
     
     def _fetch_cover_itunes(self, artist: str, album: str) -> Optional[bytes]:
         """Fetch cover art from iTunes API"""
@@ -557,6 +860,48 @@ class MetadataEnhancer:
             pass
         
         return None
+    
+    def _fetch_cover_bing(self, artist: str, album: str) -> Optional[bytes]:
+        """Scrape Bing Images first‐result for “artist album cover”"""
+        query = quote_plus(f"{artist} {album} album cover art")
+        url = f"https://www.bing.com/images/search?q={query}&form=HDRSC2"
+        resp = self.session.get(url, timeout=self.timeout)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Bing packs JSON in a “m” attribute on <a class="iusc">
+        a = soup.select_one("a.iusc")
+        if not a or "m" not in a.attrs:
+            return None
+        data = json.loads(a["m"])
+        img_url = data.get("murl")
+        if not img_url:
+            return None
+        img_resp = self.session.get(img_url, timeout=self.timeout)
+        return img_resp.content if img_resp.status_code == 200 else None
+
+    def _fetch_cover_soundcloud(self, artist: str, album: str) -> Optional[bytes]:
+        """Use SoundCloud search API to grab track/artwork as fallback"""
+        # Note: No API key needed for public search but rate‐limited
+        params = {"q": f"{artist} {album}", "limit": 1}
+        resp = self.session.get(
+            "https://api-v2.soundcloud.com/search/tracks",
+            params={**params, "client_id": "2t9loNQH90kzJcsFCODdigxfp325aq4z"},  # public client_id
+            timeout=self.timeout
+        )
+        if resp.status_code != 200:
+            return None
+        hits = resp.json().get("collection", [])
+        if not hits:
+            return None
+        # artwork_url e.g. "...-t500x500.jpg"
+        art = hits[0].get("artwork_url")
+        if not art:
+            return None
+        # pick a larger variant
+        highres = art.replace("-large", "-t500x500")
+        img = self.session.get(highres, timeout=self.timeout)
+        return img.content if img.status_code == 200 else None
     
     def _fetch_cover_lastfm(self, artist: str, album: str) -> Optional[bytes]:
         """Fetch cover art from Last.fm API (no key required for album info)"""
