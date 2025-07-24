@@ -47,6 +47,7 @@ def check_and_install_libraries():
         'requests': 'requests',
         'send2trash': 'send2trash',
         'beautifulsoup4': 'beautifulsoup4',
+        'langdetect': 'langdetect',
         'lxml': 'lxml'
     }
     
@@ -119,7 +120,9 @@ from rich.table import Table
 from rich.text import Text
 from rich.live import Live
 from send2trash import send2trash
-
+import asyncio
+from langdetect import detect, DetectorFactory
+DetectorFactory.seed = 0
 # -----------------------------------------------------------------------------
 # SECTION 2: Configuration & Data Classes
 # -----------------------------------------------------------------------------
@@ -991,33 +994,39 @@ class MusicOrganizer:
         self._show_initial_stats()
     
     def _post_processing(self):
-        """Post-processing for missing covers and lyrics"""
+        """Post‐processing for missing covers and lyrics (ask both first)."""
         logger = logging.getLogger("music_organizer")
-        
-        # Check for songs without covers
+
+        # 1) Ask both questions up front
+        retry_covers = False
+        retry_lyrics = False
+
         if self.stats.missing_covers and self.network_monitor.is_connected:
             retry_covers = Confirm.ask(
-                f"\n🖼️  {len(self.stats.missing_covers)} songs are missing covers. Search again for covers?",
+                f"\n🖼️  {len(self.stats.missing_covers)} songs are missing covers. "
+                "Search again for covers?",
                 default=False
             )
-            
-            if retry_covers:
-                console.print("\n[yellow]🖼️  Searching for missing covers...[/yellow]")
-                self._retry_missing_covers()
-        
-        # Check for songs without lyrics
+
         if self.stats.missing_lyrics and self.network_monitor.is_connected:
             retry_lyrics = Confirm.ask(
-                f"\n📝 {len(self.stats.missing_lyrics)} songs are missing lyrics. Search again for lyrics?",
+                f"📝 {len(self.stats.missing_lyrics)} songs are missing lyrics. "
+                "Search again for lyrics?",
                 default=False
             )
-            
-            if retry_lyrics:
-                console.print("\n[yellow]📝 Searching for missing lyrics...[/yellow]")
-                self._retry_missing_lyrics()
-        
-        # Show final statistics
+
+        # 2) Now trigger retries based on answers
+        if retry_covers:
+            console.print("\n[yellow]🖼️  Searching for missing covers...[/yellow]")
+            self._retry_missing_covers()
+
+        if retry_lyrics:
+            console.print("\n[yellow]📝 Searching for missing lyrics...[/yellow]")
+            self._retry_missing_lyrics()
+
+        # 3) Final summary
         self._show_final_stats()
+
     
     def _retry_missing_covers(self):
         """Retry fetching covers for songs that didn't have them"""
@@ -1274,13 +1283,19 @@ class MusicOrganizer:
             lyrics = None
             cover_art = None
             
+            
+            
             if self.network_monitor.is_connected:
                 if self.config.fetch_lyrics:
                     lyrics = self.metadata_enhancer.fetch_lyrics(
                         metadata['artist'], metadata['title']
                     )
                     if lyrics:
-                        lyrics_found = True
+                        self.stats.lyrics_found += 1
+                        # **NEW**: override metadata['language'] based on lyrics
+                metadata['language'] = self._detect_language(
+                        metadata['artist'], metadata['title'], lyrics
+                )
                 
                 if self.config.fetch_covers and metadata['album'] != 'Unknown Album':
                     cover_art = self.metadata_enhancer.fetch_cover_art(
@@ -1387,22 +1402,34 @@ class MusicOrganizer:
         
         return metadata
     
-    def _detect_language(self, artist: str, title: str) -> str:
-        """Basic language detection based on artist/title content"""
-        text = f"{artist} {title}".lower()
-        
-        # Persian/Farsi detection (basic)
-        persian_chars = re.search(r'[\u0600-\u06FF]', text)
-        if persian_chars:
+    def _detect_language(self,
+                         artist: str,
+                         title: str,
+                         lyrics: Optional[str] = None
+                        ) -> str:
+        """
+        Enhanced language detection:
+        1) Try langdetect on lyrics (if available), else artist+title
+        2) Map lang codes to your folders
+        3) Fallback to simple regex if langdetect fails
+        """
+        text = lyrics or f"{artist} {title}"
+        lang_code = 'en'
+        try:
+            lang_code = detect(text)
+        except Exception:
+            pass
+
+        if lang_code == 'fa':
             return "Persian"
-        
-        # Arabic detection
-        arabic_chars = re.search(r'[\u0600-\u06FF]', text)
-        if arabic_chars:
+        if lang_code == 'ar':
             return "Arabic"
-        
-        # Default to English for Latin characters
+        # you can add more mappings here, e.g. 'es'->"Spanish", etc.
+        # fallback: look for Persian/Arabic unicode if detect() was inconclusive
+        if re.search(r'[\u0600-\u06FF]', text):
+            return "Persian"  # catches both Arabic & Persian scripts
         return "English"
+
     
     def _get_tag_value(self, tags, keys: List[str]) -> Optional[str]:
         """Get tag value trying multiple possible keys"""
